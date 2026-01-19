@@ -487,7 +487,7 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
             if g is not None:
                 g_mean = g.float().mean().item()
                 writter.add_scalar('Train/g_mean', g_mean, global_step)
-                writter.add_histogram('Train/g_hist', g.float(), global_step)
+                writter.add_histogram('Train/g_hist', g.detach().float().cpu().numpy(), global_step)
                 g_total += g.numel()
                 g_ones += g.sum().item()
 
@@ -798,7 +798,7 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
         if log_g and g_total > 0:
             writter.add_scalar('Val/g_mean', g_ones / g_total, epoch)
             if g_values:
-                g_hist_values = torch.cat(g_values, dim=0).float()
+                g_hist_values = torch.cat(g_values, dim=0).float().cpu().numpy()
                 writter.add_histogram('Val/g_hist', g_hist_values, epoch)
 
     print()
