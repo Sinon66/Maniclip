@@ -17,7 +17,7 @@ class SmokeConfig:
     def flag_line(self) -> str:
         adv_apply_to = self.adv_apply_to if self.adv_apply_to is not None else "auto"
         return (
-            "SMOKE_FLAGS: "
+            "TRAIN_FLAGS: "
             f"use_state_mod={self.use_state_mod}, "
             f"use_adv={self.use_adv}, "
             f"use_counterfactual={self.use_counterfactual}, "
@@ -28,7 +28,7 @@ class SmokeConfig:
 def run_config(config: SmokeConfig, base_args: List[str]) -> bool:
     cmd = [sys.executable, "-u", "train_min.py", *base_args, *config.args]
     flag_line = config.flag_line()
-    print(flag_line, flush=True)
+    print(f"Running smoke config: {config.name}", flush=True)
 
     result = subprocess.run(
         cmd,
@@ -36,8 +36,8 @@ def run_config(config: SmokeConfig, base_args: List[str]) -> bool:
         stderr=subprocess.STDOUT,
         text=True,
     )
-    combined_log = f"{flag_line}\n{result.stdout}"
-    if result.stdout:
+    combined_log = result.stdout or ""
+    if combined_log:
         print(result.stdout)
 
     has_flag_log = flag_line in combined_log
