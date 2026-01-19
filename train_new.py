@@ -83,8 +83,12 @@ parser.add_argument("--protect_attr_idx", default=20, type=int,
                     help="protected attribute index for subgroup statistics")
 parser.add_argument('--use_state_mod', action='store_true',
                     help='enable state modulation gate on offsets (default: False)')
+parser.add_argument('--log_g_only', action='store_true',
+                    help='compute and log g without affecting losses (default: False)')
 parser.add_argument('--adv_weight', type=float, default=0.1,
                     help='weight for adversarial GRL loss (default: 0.1)')
+parser.add_argument('--use_adv', action='store_true',
+                    help='enable adversarial GRL loss (default: False)')
 parser.add_argument('--grl_lambda', type=float, default=1.0,
                     help='gradient reversal lambda (default: 1.0)')
 parser.add_argument('--adv_warmup_steps', type=int, default=500,
@@ -183,10 +187,16 @@ def main_worker(gpu, args):
     torch.cuda.set_device(args.gpu)
     model = model.cuda(args.gpu)
 
-    discriminator = SubgroupDiscriminator(input_dim=14 * 512).cuda(args.gpu)
+    discriminator = None
+    if args.use_adv:
+        discriminator = SubgroupDiscriminator(input_dim=14 * 512).cuda(args.gpu)
+
+    optimizer_params = list(model.parameters())
+    if discriminator is not None:
+        optimizer_params += list(discriminator.parameters())
 
     optimizer = torch.optim.Adam(
-        list(model.parameters()) + list(discriminator.parameters()),
+        optimizer_params,
         args.lr,
         betas=(0.5, 0.999)
     )
@@ -202,7 +212,7 @@ def main_worker(gpu, args):
             checkpoint = torch.load(load_path, map_location=loc)
         args.start_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'], strict=False)
-        if 'discriminator_state_dict' in checkpoint:
+        if discriminator is not None and 'discriminator_state_dict' in checkpoint:
             discriminator.load_state_dict(checkpoint['discriminator_state_dict'], strict=False)
         optimizer.load_state_dict(checkpoint['optimizer'])
         print(f"=> loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']})")
@@ -284,19 +294,23 @@ def main_worker(gpu, args):
 
         if fid < fid_best:
             fid_best = fid
-            save_checkpoint({
+            checkpoint_state = {
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'discriminator_state_dict': discriminator.state_dict(),
-            }, is_best=True, save_folder=args.save_folder)
+            }
+            if discriminator is not None:
+                checkpoint_state['discriminator_state_dict'] = discriminator.state_dict()
+            save_checkpoint(checkpoint_state, is_best=True, save_folder=args.save_folder)
         else:
-            save_checkpoint({
+            checkpoint_state = {
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'discriminator_state_dict': discriminator.state_dict(),
-            }, is_best=False, save_folder=args.save_folder)
+            }
+            if discriminator is not None:
+                checkpoint_state['discriminator_state_dict'] = discriminator.state_dict()
+            save_checkpoint(checkpoint_state, is_best=False, save_folder=args.save_folder)
 
 
 def save_checkpoint(state, is_best, save_folder, filename='latest.pth.tar'):
@@ -328,10 +342,12 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
     )
 
     model.train()
-    discriminator.train()
+    if discriminator is not None:
+        discriminator.train()
     end = time.time()
     g_total = 0
     g_ones = 0
+    keep_text_cache = {}
 
     for i, (clip_text, sampled_text, labels, exist_mask, length) in enumerate(train_loader):
         data_time.update(time.time() - end)
@@ -347,9 +363,11 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
             input_im, _ = generator([styles], input_is_latent=True, randomize_noise=False,
                                     truncation=args.truncation, truncation_latent=args.mean_latent)  # [B, 3, 256, 256]
 
-            in_attr = args.face_model(torchvision.transforms.functional.resize(input_im, 256))
-            in_preds = torch.stack(in_attr).transpose(0, 1).argmax(-1)  # [B, 40]
-            g = in_preds[:, args.protect_attr_idx]  # [B]
+            g = None
+            if args.use_state_mod or args.use_adv or args.use_counterfactual or args.log_g_only:
+                in_attr = args.face_model(torchvision.transforms.functional.resize(input_im, 256))
+                in_preds = torch.stack(in_attr).transpose(0, 1).argmax(-1)  # [B, 40]
+                g = in_preds[:, args.protect_attr_idx]  # [B]
 
         clip_text_base = clip_text
         if args.use_counterfactual:
@@ -357,8 +375,14 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
                 sampled_text_base = [str(text) for text in sampled_text]
             else:
                 sampled_text_base = [str(sampled_text)]
-            keep_texts = [f"{text}, keep gender unchanged" for text in sampled_text_base]
-            clip_text_keep = clip.tokenize(keep_texts, truncate=True)
+            keep_tokens = []
+            for text in sampled_text_base:
+                cached = keep_text_cache.get(text)
+                if cached is None:
+                    cached = clip.tokenize([f"{text}, keep gender unchanged"], truncate=True)
+                    keep_text_cache[text] = cached
+                keep_tokens.append(cached)
+            clip_text_keep = torch.cat(keep_tokens, dim=0)
             if args.gpu is not None:
                 clip_text_keep = clip_text_keep.cuda(args.gpu, non_blocking=True)
 
@@ -386,10 +410,11 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
             gen_im_keep = gen_im_keep.clamp(min=-1, max=1)
 
         loss = 0.0
-        g_mean = g.float().mean().item()
-        writter.add_scalar('Train/g_mean', g_mean, iteration_num + i)
-        g_total += g.numel()
-        g_ones += g.sum().item()
+        if g is not None:
+            g_mean = g.float().mean().item()
+            writter.add_scalar('Train/g_mean', g_mean, iteration_num + i)
+            g_total += g.numel()
+            g_ones += g.sum().item()
 
         if args.loss_face_bg_weight:
             input_im_mask_hair, input_im_mask_face = parse_mask(args, input_im)
@@ -438,29 +463,30 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
             loss_clip_base = torch.diag(loss_clip_base).mean()
             loss_clip = loss_clip_base
             if args.use_counterfactual:
-                loss_clip_keep = clip_loss(gen_im_keep, clip_text_base)
+                loss_clip_keep = clip_loss(gen_im_keep, clip_text_keep)
                 loss_clip_keep = torch.diag(loss_clip_keep).mean()
                 loss_clip = loss_clip + loss_clip_keep
             loss = loss + loss_clip * args.loss_clip_weight
             clip_losses.update(loss_clip.item(), styles.size(0))
             writter.add_scalar('Train/CLIP loss', clip_losses.avg, iteration_num + i)
 
-        adv_weight = args.adv_weight
-        if args.adv_warmup_steps > 0:
-            warmup_factor = min(1.0, float(iteration_num + i + 1) / args.adv_warmup_steps)
-            adv_weight = adv_weight * warmup_factor
-        writter.add_scalar('Train/adv_weight', adv_weight, iteration_num + i)
+        if args.use_adv and discriminator is not None and g is not None:
+            adv_weight = args.adv_weight
+            if args.adv_warmup_steps > 0:
+                warmup_factor = min(1.0, float(iteration_num + i + 1) / args.adv_warmup_steps)
+                adv_weight = adv_weight * warmup_factor
+            writter.add_scalar('Train/adv_weight', adv_weight, iteration_num + i)
 
-        logits_adv = discriminator(grad_reverse(delta_flat, args.grl_lambda))
-        loss_adv = args.ce_criterion(logits_adv, g.long())
-        loss = loss + loss_adv * adv_weight
-        adv_losses.update(loss_adv.item(), styles.size(0))
-        writter.add_scalar('Train/loss_adv', adv_losses.avg, iteration_num + i)
-        with torch.no_grad():
-            d_acc = (logits_adv.argmax(dim=1) == g).float().mean().item()
-        writter.add_scalar('Train/D_acc', d_acc, iteration_num + i)
+            logits_adv = discriminator(grad_reverse(delta_flat, args.grl_lambda))
+            loss_adv = args.ce_criterion(logits_adv, g.long())
+            loss = loss + loss_adv * adv_weight
+            adv_losses.update(loss_adv.item(), styles.size(0))
+            writter.add_scalar('Train/loss_adv', adv_losses.avg, iteration_num + i)
+            with torch.no_grad():
+                d_acc = (logits_adv.argmax(dim=1) == g).float().mean().item()
+            writter.add_scalar('Train/D_acc', d_acc, iteration_num + i)
 
-        if args.use_counterfactual:
+        if args.use_counterfactual and g is not None:
             keep_attr = args.face_model(torchvision.transforms.functional.resize(gen_im_keep, 256))
             logits_keep = torch.stack(keep_attr).transpose(0, 1)  # [B, 40, 2]
             protected_logits = logits_keep[:, args.protect_attr_idx, :]  # [B, 2]
@@ -549,7 +575,14 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
         input_im, _ = generator([styles], input_is_latent=True, randomize_noise=False,
                                 truncation=args.truncation, truncation_latent=args.mean_latent)
 
-        offset = model(styles, clip_text)
+        g = None
+        in_attr = None
+        if args.use_state_mod:
+            in_attr = args.face_model(torchvision.transforms.functional.resize(input_im, 256))
+            in_preds = torch.stack(in_attr).transpose(0, 1).argmax(-1)  # [B, 40]
+            g = in_preds[:, args.protect_attr_idx]  # [B]
+
+        offset = model(styles, clip_text, g if args.use_state_mod else None)
         new_styles = styles.unsqueeze(1).repeat(1, 14, 1) + offset
 
         gen_im, _ = generator([new_styles], input_is_latent=True, randomize_noise=False,
@@ -558,7 +591,8 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
         input_im = input_im.clamp(min=-1, max=1)
         gen_im = gen_im.clamp(min=-1, max=1)
 
-        in_attr = args.face_model(torchvision.transforms.functional.resize(input_im, 256))
+        if in_attr is None:
+            in_attr = args.face_model(torchvision.transforms.functional.resize(input_im, 256))
         gen_attr = args.face_model(torchvision.transforms.functional.resize(gen_im, 256))
         in_preds = torch.stack(in_attr).transpose(0, 1).argmax(-1)
         gen_preds = torch.stack(gen_attr).transpose(0, 1).argmax(-1)
