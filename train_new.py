@@ -688,6 +688,14 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
     g_total = 0
     g_ones = 0
     g_values = []
+    face_acc_g0_sum = 0.0
+    face_acc_g0_count = 0
+    face_acc_g1_sum = 0.0
+    face_acc_g1_count = 0
+    protect_flip_g0_sum = 0.0
+    protect_flip_g0_count = 0
+    protect_flip_g1_sum = 0.0
+    protect_flip_g1_count = 0
     for i, (clip_text, sampled_text, labels, exist_mask, length, test_latents) in enumerate(eval_loader):
         data_time.update(time.time() - end)
 
@@ -727,8 +735,23 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
         in_preds = torch.stack(in_attr).transpose(0, 1).argmax(-1)
         gen_preds = torch.stack(gen_attr).transpose(0, 1).argmax(-1)
         out_label = torch.where(exist_mask == 1, labels.long(), in_preds)
-        acc = (((gen_preds == out_label).sum(1) / gen_preds.size(1)).mean().item()) * 100
+        per_sample_acc = ((gen_preds == out_label).sum(1) / gen_preds.size(1)) * 100
+        acc = per_sample_acc.mean().item()
         acc_avg.update(acc, styles.size(0))
+        if log_g and g is not None:
+            protect_flip = (gen_preds[:, args.protect_attr_idx] != g).float()
+            g0_mask = (g == 0)
+            g1_mask = (g == 1)
+            if g0_mask.any():
+                face_acc_g0_sum += per_sample_acc[g0_mask].sum().item()
+                face_acc_g0_count += int(g0_mask.sum().item())
+                protect_flip_g0_sum += protect_flip[g0_mask].sum().item()
+                protect_flip_g0_count += int(g0_mask.sum().item())
+            if g1_mask.any():
+                face_acc_g1_sum += per_sample_acc[g1_mask].sum().item()
+                face_acc_g1_count += int(g1_mask.sum().item())
+                protect_flip_g1_sum += protect_flip[g1_mask].sum().item()
+                protect_flip_g1_count += int(g1_mask.sum().item())
 
         feat = args.inception(gen_im)[0].view(gen_im.shape[0], -1)
         features.append(feat.to('cpu'))
@@ -832,6 +855,14 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
         writter.add_scalar('Val/face id sim', 100 * (1 - id_losses.avg), epoch)
         if log_g and g_total > 0:
             writter.add_scalar('Val/g_mean', g_ones / g_total, epoch)
+            if face_acc_g0_count > 0:
+                writter.add_scalar('Val/face_acc_g0', face_acc_g0_sum / face_acc_g0_count, epoch)
+            if face_acc_g1_count > 0:
+                writter.add_scalar('Val/face_acc_g1', face_acc_g1_sum / face_acc_g1_count, epoch)
+            if protect_flip_g0_count > 0:
+                writter.add_scalar('Val/protect_flip_g0', protect_flip_g0_sum / protect_flip_g0_count, epoch)
+            if protect_flip_g1_count > 0:
+                writter.add_scalar('Val/protect_flip_g1', protect_flip_g1_sum / protect_flip_g1_count, epoch)
             if g_values:
                 g_hist_values = torch.cat(g_values, dim=0).float().cpu().numpy()
                 safe_add_histogram(
@@ -846,6 +877,15 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
     print(f'fid: {fid}', flush=True)
     print(f'face id sim: {100 * (1 - id_losses.avg)}', flush=True)
     print(f'face attribute accuracy: {acc_avg.avg}', flush=True)
+    if log_g and g_total > 0:
+        if face_acc_g0_count > 0:
+            print(f'face_acc_g0: {face_acc_g0_sum / face_acc_g0_count}', flush=True)
+        if face_acc_g1_count > 0:
+            print(f'face_acc_g1: {face_acc_g1_sum / face_acc_g1_count}', flush=True)
+        if protect_flip_g0_count > 0:
+            print(f'protect_flip_g0: {protect_flip_g0_sum / protect_flip_g0_count}', flush=True)
+        if protect_flip_g1_count > 0:
+            print(f'protect_flip_g1: {protect_flip_g1_sum / protect_flip_g1_count}', flush=True)
 
     return fid
 
