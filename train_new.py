@@ -33,6 +33,26 @@ from utils.data_processing import produce_labels
 from utils.model_irse import IRSE
 
 
+HISTOGRAM_WARNING_TAGS = set()
+
+
+def safe_add_histogram(writer, tag, values, step, fallback_values=None):
+    if writer is None:
+        return
+    try:
+        writer.add_histogram(tag, values, step)
+    except Exception as exc:
+        if fallback_values is not None:
+            try:
+                writer.add_histogram(tag, fallback_values, step)
+                return
+            except Exception as fallback_exc:
+                exc = fallback_exc
+        if tag not in HISTOGRAM_WARNING_TAGS:
+            warnings.warn(f"Skipping histogram {tag} due to error: {exc}")
+            HISTOGRAM_WARNING_TAGS.add(tag)
+
+
 parser = argparse.ArgumentParser(description='ManiCLIP Training')
 parser.add_argument('-j', '--workers', default=16, type=int, metavar='N',
                     help='number of data loading workers (default: 16)')
@@ -487,7 +507,14 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
             if g is not None:
                 g_mean = g.float().mean().item()
                 writter.add_scalar('Train/g_mean', g_mean, global_step)
-                writter.add_histogram('Train/g_hist', g.detach().float().cpu().numpy(), global_step)
+                g_hist_values = g.detach().float().cpu().numpy()
+                safe_add_histogram(
+                    writter,
+                    'Train/g_hist',
+                    g_hist_values,
+                    global_step,
+                    fallback_values=g.detach().float().cpu()
+                )
                 g_total += g.numel()
                 g_ones += g.sum().item()
 
@@ -799,7 +826,13 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
             writter.add_scalar('Val/g_mean', g_ones / g_total, epoch)
             if g_values:
                 g_hist_values = torch.cat(g_values, dim=0).float().cpu().numpy()
-                writter.add_histogram('Val/g_hist', g_hist_values, epoch)
+                safe_add_histogram(
+                    writter,
+                    'Val/g_hist',
+                    g_hist_values,
+                    epoch,
+                    fallback_values=torch.from_numpy(g_hist_values)
+                )
 
     print()
     print(f'fid: {fid}', flush=True)
