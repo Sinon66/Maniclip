@@ -89,6 +89,10 @@ parser.add_argument('--grl_lambda', type=float, default=1.0,
                     help='gradient reversal lambda (default: 1.0)')
 parser.add_argument('--adv_warmup_steps', type=int, default=500,
                     help='warmup steps to linearly ramp adv_weight (default: 500)')
+parser.add_argument('--use_counterfactual', action='store_true',
+                    help='enable counterfactual keep-edit training (default: False)')
+parser.add_argument('--w_keep', type=float, default=0.5,
+                    help='weight for keep loss in counterfactual training (default: 0.5)')
 
 
 class CLIPLoss(nn.Module):
@@ -312,12 +316,14 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
     face_norm_losses = AverageMeter('face_norm_loss', ':.4e')
     entropy_losses = AverageMeter('entropy_loss', ':.4e')
     adv_losses = AverageMeter('adv_loss', ':.4e')
+    keep_losses = AverageMeter('keep_loss', ':.4e')
+    protect_flip_rates = AverageMeter('protect_flip_rate', ':.4e')
     all_losses = AverageMeter('all_losses', ':.4e')
 
     progress = ProgressMeter(
         len(train_loader),
         [batch_time, data_time, all_losses, clip_losses, w_norm_losses, id_losses, face_norm_losses, entropy_losses,
-         adv_losses],
+         adv_losses, keep_losses],
         prefix=f"Epoch: [{epoch}]"
     )
 
@@ -345,8 +351,19 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
             in_preds = torch.stack(in_attr).transpose(0, 1).argmax(-1)  # [B, 40]
             g = in_preds[:, args.protect_attr_idx]  # [B]
 
-        offset = model(styles, clip_text, g if args.use_state_mod else None)
-        delta = offset  # offset_after_gating: [B, 14, 512]
+        clip_text_base = clip_text
+        if args.use_counterfactual:
+            if isinstance(sampled_text, (list, tuple)):
+                sampled_text_base = [str(text) for text in sampled_text]
+            else:
+                sampled_text_base = [str(sampled_text)]
+            keep_texts = [f"{text}, keep gender unchanged" for text in sampled_text_base]
+            clip_text_keep = clip.tokenize(keep_texts, truncate=True)
+            if args.gpu is not None:
+                clip_text_keep = clip_text_keep.cuda(args.gpu, non_blocking=True)
+
+        offset = model(styles, clip_text_base, g if args.use_state_mod else None)
+        delta = offset  # [B, 14, 512]
         delta_flat = delta.reshape(delta.size(0), -1)  # [B, 14 * 512]
         if args.use_state_mod:
             s = model.last_s
@@ -355,11 +372,18 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
                 writter.add_scalar('Train/s_std', s.std().item(), iteration_num + i)
         new_styles = styles.unsqueeze(1).repeat(1, 14, 1) + offset
 
-        gen_im, _ = generator([new_styles], input_is_latent=True, randomize_noise=False,
-                              truncation=args.truncation, truncation_latent=args.mean_latent)
+        gen_im_base, _ = generator([new_styles], input_is_latent=True, randomize_noise=False,
+                                   truncation=args.truncation, truncation_latent=args.mean_latent)
+        if args.use_counterfactual:
+            offset_keep = model(styles, clip_text_keep, g if args.use_state_mod else None)
+            new_styles_keep = styles.unsqueeze(1).repeat(1, 14, 1) + offset_keep
+            gen_im_keep, _ = generator([new_styles_keep], input_is_latent=True, randomize_noise=False,
+                                       truncation=args.truncation, truncation_latent=args.mean_latent)
 
         input_im = input_im.clamp(min=-1, max=1)
-        gen_im = gen_im.clamp(min=-1, max=1)
+        gen_im_base = gen_im_base.clamp(min=-1, max=1)
+        if args.use_counterfactual:
+            gen_im_keep = gen_im_keep.clamp(min=-1, max=1)
 
         loss = 0.0
         g_mean = g.float().mean().item()
@@ -370,25 +394,25 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
         if args.loss_face_bg_weight:
             input_im_mask_hair, input_im_mask_face = parse_mask(args, input_im)
             input_im_bg_mask = ((input_im_mask_hair + input_im_mask_face) == 0).float()
-            gen_im_mask_hair, gen_im_mask_face = parse_mask(args, gen_im)
+            gen_im_mask_hair, gen_im_mask_face = parse_mask(args, gen_im_base)
             gen_im_bg_mask = ((gen_im_mask_hair + gen_im_mask_face) == 0).float()
             bg_mask = ((input_im_bg_mask + gen_im_bg_mask) == 2).float()
 
-            loss_bg = torch.mean((input_im * bg_mask - gen_im * bg_mask) ** 2)
+            loss_bg = torch.mean((input_im * bg_mask - gen_im_base * bg_mask) ** 2)
             loss = loss + loss_bg * args.loss_face_bg_weight
             bg_losses.update(loss_bg.item(), styles.size(0))
             writter.add_scalar('Train/Face BG loss', bg_losses.avg, iteration_num + i)
 
         if args.loss_id_weight:
-            loss_id = args.id_loss(gen_im, input_im)
+            loss_id = args.id_loss(gen_im_base, input_im)
             loss = loss + loss_id * args.loss_id_weight
             id_losses.update(loss_id.item(), styles.size(0))
             writter.add_scalar('Train/ID loss', id_losses.avg, iteration_num + i)
 
         if args.loss_face_norm_weight:
             _, input_im_mask_face = parse_mask(args, input_im)
-            _, gen_im_mask_face = parse_mask(args, gen_im)
-            loss_face_norm = args.average_color_loss(gen_im, input_im, gen_im_mask_face, input_im_mask_face)
+            _, gen_im_mask_face = parse_mask(args, gen_im_base)
+            loss_face_norm = args.average_color_loss(gen_im_base, input_im, gen_im_mask_face, input_im_mask_face)
             loss = loss + loss_face_norm * args.loss_face_norm_weight
             face_norm_losses.update(loss_face_norm.item(), styles.size(0))
             writter.add_scalar('Train/Face norm loss', face_norm_losses.avg, iteration_num + i)
@@ -410,8 +434,13 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
             writter.add_scalar('Train/Entropy loss', entropy_losses.avg, iteration_num + i)
 
         if args.loss_clip_weight:
-            loss_clip = clip_loss(gen_im, clip_text)
-            loss_clip = torch.diag(loss_clip).mean()
+            loss_clip_base = clip_loss(gen_im_base, clip_text_base)
+            loss_clip_base = torch.diag(loss_clip_base).mean()
+            loss_clip = loss_clip_base
+            if args.use_counterfactual:
+                loss_clip_keep = clip_loss(gen_im_keep, clip_text_base)
+                loss_clip_keep = torch.diag(loss_clip_keep).mean()
+                loss_clip = loss_clip + loss_clip_keep
             loss = loss + loss_clip * args.loss_clip_weight
             clip_losses.update(loss_clip.item(), styles.size(0))
             writter.add_scalar('Train/CLIP loss', clip_losses.avg, iteration_num + i)
@@ -431,6 +460,20 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
             d_acc = (logits_adv.argmax(dim=1) == g).float().mean().item()
         writter.add_scalar('Train/D_acc', d_acc, iteration_num + i)
 
+        if args.use_counterfactual:
+            keep_attr = args.face_model(torchvision.transforms.functional.resize(gen_im_keep, 256))
+            logits_keep = torch.stack(keep_attr).transpose(0, 1)  # [B, 40, 2]
+            protected_logits = logits_keep[:, args.protect_attr_idx, :]  # [B, 2]
+            loss_keep = args.ce_criterion(protected_logits, g.long())
+            loss = loss + loss_keep * args.w_keep
+            keep_losses.update(loss_keep.item(), styles.size(0))
+            writter.add_scalar('Train/L_keep', keep_losses.avg, iteration_num + i)
+            with torch.no_grad():
+                keep_preds = logits_keep.argmax(-1)  # [B, 40]
+                protect_flip_rate = (keep_preds[:, args.protect_attr_idx] != g).float().mean().item()
+            protect_flip_rates.update(protect_flip_rate, styles.size(0))
+            writter.add_scalar('Train/protect_flip_rate', protect_flip_rates.avg, iteration_num + i)
+
         all_losses.update(loss.item(), styles.size(0))
         writter.add_scalar('Train/all loss', all_losses.avg, iteration_num + i)
 
@@ -444,7 +487,7 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
         if i % args.print_freq == 0:
             progress.display(i)
 
-            vis_ = make_grid(gen_im[:9].clamp(min=-1, max=1) * 0.5 + 0.5, nrow=3, normalize=False)
+            vis_ = make_grid(gen_im_base[:9].clamp(min=-1, max=1) * 0.5 + 0.5, nrow=3, normalize=False)
             save_path = os.path.join(args.save_folder, 'out_face')
             os.makedirs(save_path, exist_ok=True)
             torchvision.utils.save_image(vis_, os.path.join(save_path, str(epoch) + '.png'))
