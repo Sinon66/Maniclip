@@ -186,6 +186,13 @@ def main():
         )
     if args.adv_apply_to is None:
         args.adv_apply_to = 'both' if args.use_counterfactual else 'base'
+    print(
+        "TRAIN_FLAGS: "
+        f"use_state_mod={args.use_state_mod}, "
+        f"use_adv={args.use_adv}, "
+        f"use_counterfactual={args.use_counterfactual}, "
+        f"adv_apply_to={args.adv_apply_to}"
+    )
 
     if args.seed is not None:
         random.seed(args.seed)
