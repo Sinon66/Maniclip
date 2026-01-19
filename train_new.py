@@ -89,6 +89,8 @@ parser.add_argument('--adv_weight', type=float, default=0.1,
                     help='weight for adversarial GRL loss (default: 0.1)')
 parser.add_argument('--use_adv', action='store_true',
                     help='enable adversarial GRL loss (default: False)')
+parser.add_argument('--adv_apply_to', type=str, choices=['base', 'both'], default=None,
+                    help='apply adversarial loss to base branch or both (default: base, or both with counterfactual)')
 parser.add_argument('--grl_lambda', type=float, default=1.0,
                     help='gradient reversal lambda (default: 1.0)')
 parser.add_argument('--adv_warmup_steps', type=int, default=500,
@@ -143,6 +145,12 @@ def safe_write_text_lines(fp, sampled_text, max_lines=9):
 
 def main():
     args = parser.parse_args()
+    if args.use_adv and not args.use_state_mod:
+        raise ValueError(
+            "use_adv requires use_state_mod because adversarial loss is defined on gated offset (offset')"
+        )
+    if args.adv_apply_to is None:
+        args.adv_apply_to = 'both' if args.use_counterfactual else 'base'
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -386,20 +394,22 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
             if args.gpu is not None:
                 clip_text_keep = clip_text_keep.cuda(args.gpu, non_blocking=True)
 
-        offset = model(styles, clip_text_base, g if args.use_state_mod else None)
-        delta = offset  # [B, 14, 512]
-        delta_flat = delta.reshape(delta.size(0), -1)  # [B, 14 * 512]
+        offset_base = model(styles, clip_text_base, g if args.use_state_mod else None)
+        delta_base = offset_base  # [B, 14, 512] gated offset (offset')
+        delta_base_flat = delta_base.reshape(delta_base.size(0), -1)  # [B, 14 * 512]
         if args.use_state_mod:
             s = model.last_s
             if s is not None:
                 writter.add_scalar('Train/s_mean', s.mean().item(), iteration_num + i)
                 writter.add_scalar('Train/s_std', s.std().item(), iteration_num + i)
-        new_styles = styles.unsqueeze(1).repeat(1, 14, 1) + offset
+        new_styles = styles.unsqueeze(1).repeat(1, 14, 1) + offset_base
 
         gen_im_base, _ = generator([new_styles], input_is_latent=True, randomize_noise=False,
                                    truncation=args.truncation, truncation_latent=args.mean_latent)
         if args.use_counterfactual:
             offset_keep = model(styles, clip_text_keep, g if args.use_state_mod else None)
+            delta_keep = offset_keep  # [B, 14, 512] gated offset (offset')
+            delta_keep_flat = delta_keep.reshape(delta_keep.size(0), -1)
             new_styles_keep = styles.unsqueeze(1).repeat(1, 14, 1) + offset_keep
             gen_im_keep, _ = generator([new_styles_keep], input_is_latent=True, randomize_noise=False,
                                        truncation=args.truncation, truncation_latent=args.mean_latent)
@@ -443,13 +453,13 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
             writter.add_scalar('Train/Face norm loss', face_norm_losses.avg, iteration_num + i)
 
         if args.loss_w_norm_weight:
-            loss_latent_norm = torch.mean(offset ** 2)
+            loss_latent_norm = torch.mean(offset_base ** 2)
             loss = loss + loss_latent_norm * args.loss_w_norm_weight
             w_norm_losses.update(loss_latent_norm.item(), styles.size(0))
             writter.add_scalar('Train/W norm loss', w_norm_losses.avg, iteration_num + i)
 
         if args.loss_minmaxentropy_weight:
-            off = offset.reshape(offset.size(0), -1).abs()
+            off = offset_base.reshape(offset_base.size(0), -1).abs()
             offset_max = torch.max(off, 1)[0].unsqueeze(1)
             offset_min = torch.min(off, 1)[0].unsqueeze(1)
             offset_p = (off - offset_min) / (offset_max - offset_min + 1e-12) + 1e-7
@@ -477,13 +487,22 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
                 adv_weight = adv_weight * warmup_factor
             writter.add_scalar('Train/adv_weight', adv_weight, iteration_num + i)
 
-            logits_adv = discriminator(grad_reverse(delta_flat, args.grl_lambda))
-            loss_adv = args.ce_criterion(logits_adv, g.long())
+            logits_adv_base = discriminator(grad_reverse(delta_base_flat, args.grl_lambda))
+            loss_adv_base = args.ce_criterion(logits_adv_base, g.long())
+            loss_adv = loss_adv_base
+            logits_for_acc = logits_adv_base
+            g_for_acc = g
+            if args.use_counterfactual and args.adv_apply_to == 'both':
+                logits_adv_keep = discriminator(grad_reverse(delta_keep_flat, args.grl_lambda))
+                loss_adv_keep = args.ce_criterion(logits_adv_keep, g.long())
+                loss_adv = loss_adv + loss_adv_keep
+                logits_for_acc = torch.cat([logits_adv_base, logits_adv_keep], dim=0)
+                g_for_acc = torch.cat([g, g], dim=0)
             loss = loss + loss_adv * adv_weight
             adv_losses.update(loss_adv.item(), styles.size(0))
             writter.add_scalar('Train/loss_adv', adv_losses.avg, iteration_num + i)
             with torch.no_grad():
-                d_acc = (logits_adv.argmax(dim=1) == g).float().mean().item()
+                d_acc = (logits_for_acc.argmax(dim=1) == g_for_acc).float().mean().item()
             writter.add_scalar('Train/D_acc', d_acc, iteration_num + i)
 
         if args.use_counterfactual and g is not None:
