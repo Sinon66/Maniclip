@@ -79,6 +79,8 @@ parser.add_argument('--decouple', action='store_true',
                     help='Use decoupling training scheme')
 parser.add_argument("--part_sample_num", default=3, type=int,
                     help="the number of attributes sampled for each text segment")
+parser.add_argument("--protect_attr_idx", default=20, type=int,
+                    help="protected attribute index for subgroup statistics")
 
 
 class CLIPLoss(nn.Module):
@@ -300,6 +302,8 @@ def train(train_loader, model, writter, generator, clip_loss, optimizer, epoch, 
 
     model.train()
     end = time.time()
+    g_total = 0
+    g_ones = 0
 
     for i, (clip_text, sampled_text, labels, exist_mask, length) in enumerate(train_loader):
         data_time.update(time.time() - end)
@@ -313,7 +317,11 @@ def train(train_loader, model, writter, generator, clip_loss, optimizer, epoch, 
             code = torch.randn(args.batch_size, 512).cuda()
             styles = generator.style(code)
             input_im, _ = generator([styles], input_is_latent=True, randomize_noise=False,
-                                    truncation=args.truncation, truncation_latent=args.mean_latent)
+                                    truncation=args.truncation, truncation_latent=args.mean_latent)  # [B, 3, 256, 256]
+
+            in_attr = args.face_model(torchvision.transforms.functional.resize(input_im, 256))
+            in_preds = torch.stack(in_attr).transpose(0, 1).argmax(-1)  # [B, 40]
+            g = in_preds[:, args.protect_attr_idx]  # [B]
 
         offset = model(styles, clip_text)
         new_styles = styles.unsqueeze(1).repeat(1, 14, 1) + offset
@@ -325,6 +333,10 @@ def train(train_loader, model, writter, generator, clip_loss, optimizer, epoch, 
         gen_im = gen_im.clamp(min=-1, max=1)
 
         loss = 0.0
+        g_mean = g.float().mean().item()
+        writter.add_scalar('Train/g_mean', g_mean, iteration_num + i)
+        g_total += g.numel()
+        g_ones += g.sum().item()
 
         if args.loss_face_bg_weight:
             input_im_mask_hair, input_im_mask_face = parse_mask(args, input_im)
@@ -402,6 +414,13 @@ def train(train_loader, model, writter, generator, clip_loss, optimizer, epoch, 
             os.makedirs(save_path, exist_ok=True)
             with open(os.path.join(save_path, str(epoch) + '.txt'), 'w') as n:
                 safe_write_text_lines(n, sampled_text, max_lines=9)
+
+    if g_total > 0:
+        g_zeros = g_total - g_ones
+        print(
+            f"Epoch {epoch} g distribution (protect_attr_idx={args.protect_attr_idx}): "
+            f"0={g_zeros} 1={g_ones} mean={g_ones / g_total:.4f}"
+        )
 
     return clip_losses.avg
 
