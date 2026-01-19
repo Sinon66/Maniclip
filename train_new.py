@@ -98,6 +98,10 @@ parser.add_argument('--adv_warmup_steps', type=int, default=500,
                     help='warmup steps to linearly ramp adv_weight (default: 500)')
 parser.add_argument('--use_counterfactual', action='store_true',
                     help='enable counterfactual keep-edit training (default: False)')
+parser.add_argument('--counterfactual_every', type=int, default=1,
+                    help='run keep branch every N steps when use_counterfactual is enabled (default: 1)')
+parser.add_argument('--cf_microbatch', type=int, default=0,
+                    help='counterfactual microbatch size (0 disables microbatching)')
 parser.add_argument('--w_keep', type=float, default=0.5,
                     help='weight for keep loss in counterfactual training (default: 0.5)')
 parser.add_argument('--keep_text_cache_size', type=int, default=4096,
@@ -152,6 +156,10 @@ def safe_write_text_lines(fp, sampled_text, max_lines=9):
 
 def main():
     args = parser.parse_args()
+    if args.counterfactual_every < 1:
+        raise ValueError("counterfactual_every must be >= 1")
+    if args.cf_microbatch < 0:
+        raise ValueError("cf_microbatch must be >= 0")
     if args.use_adv and not args.use_state_mod:
         raise ValueError(
             "use_adv requires use_state_mod because adversarial loss is defined on gated offset (offset')"
@@ -374,178 +382,208 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
     for i, (clip_text, sampled_text, labels, exist_mask, length) in enumerate(train_loader):
         data_time.update(time.time() - end)
 
-        if args.gpu is not None:
-            clip_text = clip_text.cuda(args.gpu, non_blocking=True)
-            labels = labels.cuda(args.gpu, non_blocking=True)
-            exist_mask = exist_mask.cuda(args.gpu, non_blocking=True)
+        global_step = iteration_num + i
+        cf_enabled_this_step = args.use_counterfactual and (global_step % args.counterfactual_every == 0)
+        writter.add_scalar('Train/cf_enabled_this_step', int(cf_enabled_this_step), global_step)
+        writter.add_scalar('Train/cf_microbatch', args.cf_microbatch, global_step)
+        if args.use_counterfactual and not cf_enabled_this_step and i % args.print_freq == 0:
+            print(f"[Step {global_step}] Counterfactual keep skipped (counterfactual_every={args.counterfactual_every}).")
 
-        with torch.no_grad():
-            code = torch.randn(args.batch_size, 512).cuda()
-            styles = generator.style(code)
-            input_im, _ = generator([styles], input_is_latent=True, randomize_noise=False,
-                                    truncation=args.truncation, truncation_latent=args.mean_latent)  # [B, 3, 256, 256]
+        def _slice_sampled_text(sampled, start, end):
+            if isinstance(sampled, (list, tuple)):
+                return sampled[start:end]
+            return sampled
 
-            g = None
-            if args.use_state_mod or args.use_adv or args.use_counterfactual or args.log_g_only:
-                in_attr = args.face_model(torchvision.transforms.functional.resize(input_im, 256))
-                in_preds = torch.stack(in_attr).transpose(0, 1).argmax(-1)  # [B, 40]
-                g = in_preds[:, args.protect_attr_idx]  # [B]
-
-        clip_text_base = clip_text
-        if args.use_counterfactual:
-            if isinstance(sampled_text, (list, tuple)):
-                sampled_text_base = [str(text) for text in sampled_text]
-            else:
-                sampled_text_base = [str(sampled_text)]
-            keep_tokens = []
-            for text in sampled_text_base:
-                if cache_enabled:
-                    cached = keep_text_cache.get(text)
-                    if cached is None:
-                        cached = clip.tokenize([f"{text}, keep gender unchanged"], truncate=True)
-                        keep_text_cache[text] = cached
-                        keep_text_cache.move_to_end(text)
-                        if len(keep_text_cache) > args.keep_text_cache_size:
-                            keep_text_cache.popitem(last=False)
-                    else:
-                        keep_text_cache.move_to_end(text)
-                    keep_tokens.append(cached)
-                else:
-                    keep_tokens.append(clip.tokenize([f"{text}, keep gender unchanged"], truncate=True))
-            clip_text_keep = torch.cat(keep_tokens, dim=0)
-            if args.gpu is not None:
-                clip_text_keep = clip_text_keep.cuda(args.gpu, non_blocking=True)
-
-        offset_base = model(styles, clip_text_base, g if args.use_state_mod else None)
-        delta_base = offset_base  # [B, 14, 512] gated offset (offset')
-        delta_base_flat = delta_base.reshape(delta_base.size(0), -1)  # [B, 14 * 512]
-        if args.use_state_mod:
-            s = model.last_s
-            if s is not None:
-                writter.add_scalar('Train/s_mean', s.mean().item(), iteration_num + i)
-                writter.add_scalar('Train/s_std', s.std().item(), iteration_num + i)
-        new_styles = styles.unsqueeze(1).repeat(1, 14, 1) + offset_base
-
-        gen_im_base, _ = generator([new_styles], input_is_latent=True, randomize_noise=False,
-                                   truncation=args.truncation, truncation_latent=args.mean_latent)
-        if args.use_counterfactual:
-            offset_keep = model(styles, clip_text_keep, g if args.use_state_mod else None)
-            delta_keep = offset_keep  # [B, 14, 512] gated offset (offset')
-            delta_keep_flat = delta_keep.reshape(delta_keep.size(0), -1)
-            new_styles_keep = styles.unsqueeze(1).repeat(1, 14, 1) + offset_keep
-            gen_im_keep, _ = generator([new_styles_keep], input_is_latent=True, randomize_noise=False,
-                                       truncation=args.truncation, truncation_latent=args.mean_latent)
-
-        input_im = input_im.clamp(min=-1, max=1)
-        gen_im_base = gen_im_base.clamp(min=-1, max=1)
-        if args.use_counterfactual:
-            gen_im_keep = gen_im_keep.clamp(min=-1, max=1)
-
-        loss = 0.0
-        if g is not None:
-            g_mean = g.float().mean().item()
-            writter.add_scalar('Train/g_mean', g_mean, iteration_num + i)
-            g_total += g.numel()
-            g_ones += g.sum().item()
-
-        if args.loss_face_bg_weight:
-            input_im_mask_hair, input_im_mask_face = parse_mask(args, input_im)
-            input_im_bg_mask = ((input_im_mask_hair + input_im_mask_face) == 0).float()
-            gen_im_mask_hair, gen_im_mask_face = parse_mask(args, gen_im_base)
-            gen_im_bg_mask = ((gen_im_mask_hair + gen_im_mask_face) == 0).float()
-            bg_mask = ((input_im_bg_mask + gen_im_bg_mask) == 2).float()
-
-            loss_bg = torch.mean((input_im * bg_mask - gen_im_base * bg_mask) ** 2)
-            loss = loss + loss_bg * args.loss_face_bg_weight
-            bg_losses.update(loss_bg.item(), styles.size(0))
-            writter.add_scalar('Train/Face BG loss', bg_losses.avg, iteration_num + i)
-
-        if args.loss_id_weight:
-            loss_id = args.id_loss(gen_im_base, input_im)
-            loss = loss + loss_id * args.loss_id_weight
-            id_losses.update(loss_id.item(), styles.size(0))
-            writter.add_scalar('Train/ID loss', id_losses.avg, iteration_num + i)
-
-        if args.loss_face_norm_weight:
-            _, input_im_mask_face = parse_mask(args, input_im)
-            _, gen_im_mask_face = parse_mask(args, gen_im_base)
-            loss_face_norm = args.average_color_loss(gen_im_base, input_im, gen_im_mask_face, input_im_mask_face)
-            loss = loss + loss_face_norm * args.loss_face_norm_weight
-            face_norm_losses.update(loss_face_norm.item(), styles.size(0))
-            writter.add_scalar('Train/Face norm loss', face_norm_losses.avg, iteration_num + i)
-
-        if args.loss_w_norm_weight:
-            loss_latent_norm = torch.mean(offset_base ** 2)
-            loss = loss + loss_latent_norm * args.loss_w_norm_weight
-            w_norm_losses.update(loss_latent_norm.item(), styles.size(0))
-            writter.add_scalar('Train/W norm loss', w_norm_losses.avg, iteration_num + i)
-
-        if args.loss_minmaxentropy_weight:
-            off = offset_base.reshape(offset_base.size(0), -1).abs()
-            offset_max = torch.max(off, 1)[0].unsqueeze(1)
-            offset_min = torch.min(off, 1)[0].unsqueeze(1)
-            offset_p = (off - offset_min) / (offset_max - offset_min + 1e-12) + 1e-7
-            pseudo_entropy_loss = (-(offset_p * torch.log(offset_p)).sum(1).mean()) * 0.0001
-            loss = loss + args.loss_minmaxentropy_weight * pseudo_entropy_loss
-            entropy_losses.update(pseudo_entropy_loss.item(), styles.size(0))
-            writter.add_scalar('Train/Entropy loss', entropy_losses.avg, iteration_num + i)
-
-        if args.loss_clip_weight:
-            loss_clip_base = clip_loss(gen_im_base, clip_text_base)
-            loss_clip_base = torch.diag(loss_clip_base).mean()
-            loss_clip = loss_clip_base
-            if args.use_counterfactual:
-                loss_clip_keep = clip_loss(gen_im_keep, clip_text_keep)
-                loss_clip_keep = torch.diag(loss_clip_keep).mean()
-                loss_clip = loss_clip + loss_clip_keep
-            loss = loss + loss_clip * args.loss_clip_weight
-            clip_losses.update(loss_clip.item(), styles.size(0))
-            writter.add_scalar('Train/CLIP loss', clip_losses.avg, iteration_num + i)
-
-        if args.use_adv and discriminator is not None and g is not None:
-            adv_weight = args.adv_weight
-            if args.adv_warmup_steps > 0:
-                warmup_factor = min(1.0, float(iteration_num + i + 1) / args.adv_warmup_steps)
-                adv_weight = adv_weight * warmup_factor
-            writter.add_scalar('Train/adv_weight', adv_weight, iteration_num + i)
-
-            logits_adv_base = discriminator(grad_reverse(delta_base_flat, args.grl_lambda))
-            loss_adv_base = args.ce_criterion(logits_adv_base, g.long())
-            loss_adv = loss_adv_base
-            logits_for_acc = logits_adv_base
-            g_for_acc = g
-            if args.use_counterfactual and args.adv_apply_to == 'both':
-                logits_adv_keep = discriminator(grad_reverse(delta_keep_flat, args.grl_lambda))
-                loss_adv_keep = args.ce_criterion(logits_adv_keep, g.long())
-                loss_adv = loss_adv + loss_adv_keep
-                logits_for_acc = torch.cat([logits_adv_base, logits_adv_keep], dim=0)
-                g_for_acc = torch.cat([g, g], dim=0)
-            loss = loss + loss_adv * adv_weight
-            adv_losses.update(loss_adv.item(), styles.size(0))
-            writter.add_scalar('Train/loss_adv', adv_losses.avg, iteration_num + i)
-            with torch.no_grad():
-                d_acc = (logits_for_acc.argmax(dim=1) == g_for_acc).float().mean().item()
-            writter.add_scalar('Train/D_acc', d_acc, iteration_num + i)
-
-        if args.use_counterfactual and g is not None:
-            keep_attr = args.face_model(torchvision.transforms.functional.resize(gen_im_keep, 256))
-            logits_keep = torch.stack(keep_attr).transpose(0, 1)  # [B, 40, 2]
-            protected_logits = logits_keep[:, args.protect_attr_idx, :]  # [B, 2]
-            loss_keep = args.ce_criterion(protected_logits, g.long())
-            loss = loss + loss_keep * args.w_keep
-            keep_losses.update(loss_keep.item(), styles.size(0))
-            writter.add_scalar('Train/L_keep', keep_losses.avg, iteration_num + i)
-            with torch.no_grad():
-                keep_preds = logits_keep.argmax(-1)  # [B, 40]
-                protect_flip_rate = (keep_preds[:, args.protect_attr_idx] != g).float().mean().item()
-            protect_flip_rates.update(protect_flip_rate, styles.size(0))
-            writter.add_scalar('Train/protect_flip_rate', protect_flip_rates.avg, iteration_num + i)
-
-        all_losses.update(loss.item(), styles.size(0))
-        writter.add_scalar('Train/all loss', all_losses.avg, iteration_num + i)
+        batch_size = clip_text.size(0)
+        microbatch_size = args.cf_microbatch if args.cf_microbatch > 0 else batch_size
+        microbatch_size = min(microbatch_size, batch_size)
 
         optimizer.zero_grad()
-        loss.backward()
+        for mb_start in range(0, batch_size, microbatch_size):
+            mb_end = min(batch_size, mb_start + microbatch_size)
+            mb_count = mb_end - mb_start
+            clip_text_mb = clip_text[mb_start:mb_end]
+            labels_mb = labels[mb_start:mb_end]
+            exist_mask_mb = exist_mask[mb_start:mb_end]
+            sampled_text_mb = _slice_sampled_text(sampled_text, mb_start, mb_end)
+
+            if args.gpu is not None:
+                clip_text_mb = clip_text_mb.cuda(args.gpu, non_blocking=True)
+                labels_mb = labels_mb.cuda(args.gpu, non_blocking=True)
+                exist_mask_mb = exist_mask_mb.cuda(args.gpu, non_blocking=True)
+
+            with torch.no_grad():
+                code = torch.randn(mb_count, 512).cuda()
+                styles = generator.style(code)
+                input_im, _ = generator([styles], input_is_latent=True, randomize_noise=False,
+                                        truncation=args.truncation, truncation_latent=args.mean_latent)
+
+                g = None
+                if args.use_state_mod or args.use_adv or args.use_counterfactual or args.log_g_only:
+                    in_attr = args.face_model(torchvision.transforms.functional.resize(input_im, 256))
+                    in_preds = torch.stack(in_attr).transpose(0, 1).argmax(-1)
+                    g = in_preds[:, args.protect_attr_idx]
+
+            clip_text_base = clip_text_mb
+            clip_text_keep = None
+            if args.use_counterfactual and cf_enabled_this_step:
+                if isinstance(sampled_text_mb, (list, tuple)):
+                    sampled_text_base = [str(text) for text in sampled_text_mb]
+                else:
+                    sampled_text_base = [str(sampled_text_mb)]
+                keep_tokens = []
+                for text in sampled_text_base:
+                    if cache_enabled:
+                        cached = keep_text_cache.get(text)
+                        if cached is None:
+                            cached = clip.tokenize([f"{text}, keep gender unchanged"], truncate=True)
+                            keep_text_cache[text] = cached
+                            keep_text_cache.move_to_end(text)
+                            if len(keep_text_cache) > args.keep_text_cache_size:
+                                keep_text_cache.popitem(last=False)
+                        else:
+                            keep_text_cache.move_to_end(text)
+                        keep_tokens.append(cached)
+                    else:
+                        keep_tokens.append(clip.tokenize([f"{text}, keep gender unchanged"], truncate=True))
+                clip_text_keep = torch.cat(keep_tokens, dim=0)
+                if args.gpu is not None:
+                    clip_text_keep = clip_text_keep.cuda(args.gpu, non_blocking=True)
+
+            offset_base = model(styles, clip_text_base, g if args.use_state_mod else None)
+            delta_base = offset_base
+            delta_base_flat = delta_base.reshape(delta_base.size(0), -1)
+            if args.use_state_mod:
+                s = model.last_s
+                if s is not None:
+                    writter.add_scalar('Train/s_mean', s.mean().item(), global_step)
+                    writter.add_scalar('Train/s_std', s.std().item(), global_step)
+            new_styles = styles.unsqueeze(1).repeat(1, 14, 1) + offset_base
+
+            gen_im_base, _ = generator([new_styles], input_is_latent=True, randomize_noise=False,
+                                       truncation=args.truncation, truncation_latent=args.mean_latent)
+            if args.use_counterfactual and cf_enabled_this_step:
+                offset_keep = model(styles, clip_text_keep, g if args.use_state_mod else None)
+                delta_keep = offset_keep
+                delta_keep_flat = delta_keep.reshape(delta_keep.size(0), -1)
+                new_styles_keep = styles.unsqueeze(1).repeat(1, 14, 1) + offset_keep
+                gen_im_keep, _ = generator([new_styles_keep], input_is_latent=True, randomize_noise=False,
+                                           truncation=args.truncation, truncation_latent=args.mean_latent)
+
+            input_im = input_im.clamp(min=-1, max=1)
+            gen_im_base = gen_im_base.clamp(min=-1, max=1)
+            if args.use_counterfactual and cf_enabled_this_step:
+                gen_im_keep = gen_im_keep.clamp(min=-1, max=1)
+
+            loss = 0.0
+            if g is not None:
+                g_mean = g.float().mean().item()
+                writter.add_scalar('Train/g_mean', g_mean, global_step)
+                g_total += g.numel()
+                g_ones += g.sum().item()
+
+            if args.loss_face_bg_weight:
+                input_im_mask_hair, input_im_mask_face = parse_mask(args, input_im)
+                input_im_bg_mask = ((input_im_mask_hair + input_im_mask_face) == 0).float()
+                gen_im_mask_hair, gen_im_mask_face = parse_mask(args, gen_im_base)
+                gen_im_bg_mask = ((gen_im_mask_hair + gen_im_mask_face) == 0).float()
+                bg_mask = ((input_im_bg_mask + gen_im_bg_mask) == 2).float()
+
+                loss_bg = torch.mean((input_im * bg_mask - gen_im_base * bg_mask) ** 2)
+                loss = loss + loss_bg * args.loss_face_bg_weight
+                bg_losses.update(loss_bg.item(), styles.size(0))
+                writter.add_scalar('Train/Face BG loss', bg_losses.avg, global_step)
+
+            if args.loss_id_weight:
+                loss_id = args.id_loss(gen_im_base, input_im)
+                loss = loss + loss_id * args.loss_id_weight
+                id_losses.update(loss_id.item(), styles.size(0))
+                writter.add_scalar('Train/ID loss', id_losses.avg, global_step)
+
+            if args.loss_face_norm_weight:
+                _, input_im_mask_face = parse_mask(args, input_im)
+                _, gen_im_mask_face = parse_mask(args, gen_im_base)
+                loss_face_norm = args.average_color_loss(gen_im_base, input_im, gen_im_mask_face, input_im_mask_face)
+                loss = loss + loss_face_norm * args.loss_face_norm_weight
+                face_norm_losses.update(loss_face_norm.item(), styles.size(0))
+                writter.add_scalar('Train/Face norm loss', face_norm_losses.avg, global_step)
+
+            if args.loss_w_norm_weight:
+                loss_latent_norm = torch.mean(offset_base ** 2)
+                loss = loss + loss_latent_norm * args.loss_w_norm_weight
+                w_norm_losses.update(loss_latent_norm.item(), styles.size(0))
+                writter.add_scalar('Train/W norm loss', w_norm_losses.avg, global_step)
+
+            if args.loss_minmaxentropy_weight:
+                off = offset_base.reshape(offset_base.size(0), -1).abs()
+                offset_max = torch.max(off, 1)[0].unsqueeze(1)
+                offset_min = torch.min(off, 1)[0].unsqueeze(1)
+                offset_p = (off - offset_min) / (offset_max - offset_min + 1e-12) + 1e-7
+                pseudo_entropy_loss = (-(offset_p * torch.log(offset_p)).sum(1).mean()) * 0.0001
+                loss = loss + args.loss_minmaxentropy_weight * pseudo_entropy_loss
+                entropy_losses.update(pseudo_entropy_loss.item(), styles.size(0))
+                writter.add_scalar('Train/Entropy loss', entropy_losses.avg, global_step)
+
+            if args.loss_clip_weight:
+                loss_clip_base = clip_loss(gen_im_base, clip_text_base)
+                loss_clip_base = torch.diag(loss_clip_base).mean()
+                loss_clip = loss_clip_base
+                if args.use_counterfactual and cf_enabled_this_step:
+                    loss_clip_keep = clip_loss(gen_im_keep, clip_text_keep)
+                    loss_clip_keep = torch.diag(loss_clip_keep).mean()
+                    loss_clip = loss_clip + loss_clip_keep
+                loss = loss + loss_clip * args.loss_clip_weight
+                clip_losses.update(loss_clip.item(), styles.size(0))
+                writter.add_scalar('Train/CLIP loss', clip_losses.avg, global_step)
+
+            if args.use_adv and discriminator is not None and g is not None:
+                adv_weight = args.adv_weight
+                if args.adv_warmup_steps > 0:
+                    warmup_factor = min(1.0, float(global_step + 1) / args.adv_warmup_steps)
+                    adv_weight = adv_weight * warmup_factor
+                writter.add_scalar('Train/adv_weight', adv_weight, global_step)
+
+                logits_adv_base = discriminator(grad_reverse(delta_base_flat, args.grl_lambda))
+                loss_adv_base = args.ce_criterion(logits_adv_base, g.long())
+                loss_adv = loss_adv_base
+                logits_for_acc = logits_adv_base
+                g_for_acc = g
+                if args.use_counterfactual and cf_enabled_this_step and args.adv_apply_to == 'both':
+                    logits_adv_keep = discriminator(grad_reverse(delta_keep_flat, args.grl_lambda))
+                    loss_adv_keep = args.ce_criterion(logits_adv_keep, g.long())
+                    loss_adv = loss_adv + loss_adv_keep
+                    logits_for_acc = torch.cat([logits_adv_base, logits_adv_keep], dim=0)
+                    g_for_acc = torch.cat([g, g], dim=0)
+                loss = loss + loss_adv * adv_weight
+                adv_losses.update(loss_adv.item(), styles.size(0))
+                writter.add_scalar('Train/loss_adv', adv_losses.avg, global_step)
+                with torch.no_grad():
+                    d_acc = (logits_for_acc.argmax(dim=1) == g_for_acc).float().mean().item()
+                writter.add_scalar('Train/D_acc', d_acc, global_step)
+
+            if args.use_counterfactual and g is not None and cf_enabled_this_step:
+                keep_attr = args.face_model(torchvision.transforms.functional.resize(gen_im_keep, 256))
+                logits_keep = torch.stack(keep_attr).transpose(0, 1)
+                protected_logits = logits_keep[:, args.protect_attr_idx, :]
+                loss_keep = args.ce_criterion(protected_logits, g.long())
+                loss = loss + loss_keep * args.w_keep
+                keep_losses.update(loss_keep.item(), styles.size(0))
+                writter.add_scalar('Train/L_keep', keep_losses.avg, global_step)
+                with torch.no_grad():
+                    keep_preds = logits_keep.argmax(-1)
+                    protect_flip_rate = (keep_preds[:, args.protect_attr_idx] != g).float().mean().item()
+                protect_flip_rates.update(protect_flip_rate, styles.size(0))
+                writter.add_scalar('Train/protect_flip_rate', protect_flip_rates.avg, global_step)
+            elif args.use_counterfactual and g is not None and not cf_enabled_this_step:
+                keep_losses.update(0.0, styles.size(0))
+                writter.add_scalar('Train/L_keep', keep_losses.avg, global_step)
+
+            all_losses.update(loss.item(), styles.size(0))
+            writter.add_scalar('Train/all loss', all_losses.avg, global_step)
+
+            scale = float(mb_count) / float(batch_size)
+            (loss * scale).backward()
+
         optimizer.step()
 
         batch_time.update(time.time() - end)
