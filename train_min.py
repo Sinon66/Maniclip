@@ -37,9 +37,10 @@ class MinTextDataset(data.Dataset):
             self.text_files = self.text_files[:train_num]
             self.anno = self.anno[:train_num]
         else:
+            self.test_latents = torch.load("data/test_latents_seed100.pt")
+            val_num = min(val_num, self.test_latents.shape[0])
             self.text_files = self.text_files[train_num:train_num + val_num]
             self.anno = self.anno[train_num:train_num + val_num]
-            self.test_latents = torch.load("data/test_latents_seed100.pt")
 
         self.split = split
         self.non_represents = ["no", "hair", "wearing", "eyebrows", "eyes", "big", "nose", "o"]
@@ -77,6 +78,7 @@ class MinPartTextDataset(data.Dataset):
         if val_num is None:
             val_num = DEFAULT_VAL_NUM
         self.test_latents = torch.load("data/test_latents_seed100.pt")
+        val_num = min(val_num, self.test_latents.shape[0])
         self.split = split
         self.sample_num = sample_num
 
@@ -196,6 +198,8 @@ def main():
     DEFAULT_TRAIN_NUM = min_args.train_num
     DEFAULT_VAL_NUM = min_args.val_num
 
+    _ensure_arg("--train_num", DEFAULT_TRAIN_NUM)
+    _ensure_arg("--val_num", DEFAULT_VAL_NUM)
     _ensure_arg("--epochs", 1)
     _ensure_arg("--batch-size", 1)
     _ensure_arg("--test_batch", 1)
