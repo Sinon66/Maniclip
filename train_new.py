@@ -577,6 +577,8 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
 
     sample_mean = np.mean(features, 0)
     sample_cov = np.cov(features, rowvar=False)
+    if sample_cov.ndim == 0:
+        sample_cov = np.zeros((features.shape[1], features.shape[1]))
 
     fid = calc_fid(sample_mean, sample_cov, args.real_mean, args.real_cov)
     if writter is not None:
