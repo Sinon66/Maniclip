@@ -5,6 +5,7 @@ import numpy as np
 import random
 import warnings
 import time
+from collections import OrderedDict
 from typing import Optional
 
 import torch
@@ -99,6 +100,12 @@ parser.add_argument('--use_counterfactual', action='store_true',
                     help='enable counterfactual keep-edit training (default: False)')
 parser.add_argument('--w_keep', type=float, default=0.5,
                     help='weight for keep loss in counterfactual training (default: 0.5)')
+parser.add_argument('--keep_text_cache_size', type=int, default=4096,
+                    help='max size for keep_text_cache LRU (0 disables cache)')
+parser.add_argument('--train_num', type=int, default=None,
+                    help='(train_min) override train split length when provided')
+parser.add_argument('--val_num', type=int, default=None,
+                    help='(train_min) override val split length when provided')
 
 
 class CLIPLoss(nn.Module):
@@ -229,9 +236,14 @@ def main_worker(gpu, args):
 
     # Train loader
     if args.decouple:
-        dataset_train = PartTextDataset(split='train', sample_num=args.part_sample_num)
+        dataset_train = PartTextDataset(
+            split='train',
+            sample_num=args.part_sample_num,
+            train_num=args.train_num,
+            val_num=args.val_num,
+        )
     else:
-        dataset_train = TextDataset(split='train')
+        dataset_train = TextDataset(split='train', train_num=args.train_num, val_num=args.val_num)
 
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
@@ -243,7 +255,7 @@ def main_worker(gpu, args):
     )
 
     # Eval loader: always uses TextDataset in this codebase
-    dataset_eval = TextDataset(split='eval')
+    dataset_eval = TextDataset(split='eval', train_num=args.train_num, val_num=args.val_num)
     eval_loader = torch.utils.data.DataLoader(
         dataset_eval,
         batch_size=args.test_batch,
@@ -355,7 +367,9 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
     end = time.time()
     g_total = 0
     g_ones = 0
-    keep_text_cache = {}
+    keep_text_cache = OrderedDict()
+    cache_enabled = args.keep_text_cache_size > 0
+    print(f"keep_text_cache enabled: {cache_enabled} / size: {args.keep_text_cache_size}")
 
     for i, (clip_text, sampled_text, labels, exist_mask, length) in enumerate(train_loader):
         data_time.update(time.time() - end)
@@ -385,11 +399,19 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
                 sampled_text_base = [str(sampled_text)]
             keep_tokens = []
             for text in sampled_text_base:
-                cached = keep_text_cache.get(text)
-                if cached is None:
-                    cached = clip.tokenize([f"{text}, keep gender unchanged"], truncate=True)
-                    keep_text_cache[text] = cached
-                keep_tokens.append(cached)
+                if cache_enabled:
+                    cached = keep_text_cache.get(text)
+                    if cached is None:
+                        cached = clip.tokenize([f"{text}, keep gender unchanged"], truncate=True)
+                        keep_text_cache[text] = cached
+                        keep_text_cache.move_to_end(text)
+                        if len(keep_text_cache) > args.keep_text_cache_size:
+                            keep_text_cache.popitem(last=False)
+                    else:
+                        keep_text_cache.move_to_end(text)
+                    keep_tokens.append(cached)
+                else:
+                    keep_tokens.append(clip.tokenize([f"{text}, keep gender unchanged"], truncate=True))
             clip_text_keep = torch.cat(keep_tokens, dim=0)
             if args.gpu is not None:
                 clip_text_keep = clip_text_keep.cuda(args.gpu, non_blocking=True)
@@ -729,7 +751,7 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
 
 
 class TextDataset(data.Dataset):
-    def __init__(self, split='train'):
+    def __init__(self, split='train', train_num=None, val_num=None):
         self.text_dir = 'data/celeba-caption/'
         self.text_files = os.listdir(self.text_dir)
         self.text_files.sort(key=int_item)
@@ -741,13 +763,18 @@ class TextDataset(data.Dataset):
         self.attrs = np.array([' '.join(a.split('_')).lower() for a in attrs], dtype=object)
         self.anno = data_lines[2:]
 
-        train_num = 25000
+        if train_num is None:
+            train_num = 25000
         if split == 'train':
             self.text_files = self.text_files[:train_num]
             self.anno = self.anno[:train_num]
         else:
-            self.text_files = self.text_files[train_num:]
-            self.anno = self.anno[train_num:]
+            if val_num is None:
+                self.text_files = self.text_files[train_num:]
+                self.anno = self.anno[train_num:]
+            else:
+                self.text_files = self.text_files[train_num:train_num + val_num]
+                self.anno = self.anno[train_num:train_num + val_num]
             self.test_latents = torch.load('data/test_latents_seed100.pt')
 
         self.split = split
@@ -775,7 +802,7 @@ class TextDataset(data.Dataset):
 
 
 class PartTextDataset(data.Dataset):
-    def __init__(self, split='train', sample_num=3):
+    def __init__(self, split='train', sample_num=3, train_num=None, val_num=None):
         self.test_latents = torch.load('data/test_latents_seed100.pt')
         self.split = split
         self.sample_num = sample_num
@@ -786,7 +813,16 @@ class PartTextDataset(data.Dataset):
         attrs[-1] = attrs[-1][:-1]
         self.attrs = np.array([' '.join(a.split('_')).lower() for a in attrs], dtype=object)
 
-        self.img_attr = self.data[2:25002]
+        if train_num is None:
+            train_num = 25000
+        if split == 'train':
+            self.img_attr = self.data[2:2 + train_num]
+        else:
+            if val_num is None:
+                self.img_attr = self.data[2 + train_num:]
+            else:
+                start = 2 + train_num
+                self.img_attr = self.data[start:start + val_num]
 
         self.hair = ['bald', 'bangs', 'black hair', 'blond hair', 'brown hair', 'gray hair',
                      'receding hairline', 'straight hair', 'wavy hair']
