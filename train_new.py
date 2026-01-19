@@ -81,6 +81,8 @@ parser.add_argument("--part_sample_num", default=3, type=int,
                     help="the number of attributes sampled for each text segment")
 parser.add_argument("--protect_attr_idx", default=20, type=int,
                     help="protected attribute index for subgroup statistics")
+parser.add_argument('--use_state_mod', action='store_true',
+                    help='enable state modulation gate on offsets (default: False)')
 
 
 class CLIPLoss(nn.Module):
@@ -323,7 +325,12 @@ def train(train_loader, model, writter, generator, clip_loss, optimizer, epoch, 
             in_preds = torch.stack(in_attr).transpose(0, 1).argmax(-1)  # [B, 40]
             g = in_preds[:, args.protect_attr_idx]  # [B]
 
-        offset = model(styles, clip_text)
+        offset = model(styles, clip_text, g if args.use_state_mod else None)
+        if args.use_state_mod:
+            s = model.last_s
+            if s is not None:
+                writter.add_scalar('Train/s_mean', s.mean().item(), iteration_num + i)
+                writter.add_scalar('Train/s_std', s.std().item(), iteration_num + i)
         new_styles = styles.unsqueeze(1).repeat(1, 14, 1) + offset
 
         gen_im, _ = generator([new_styles], input_is_latent=True, randomize_noise=False,
@@ -570,6 +577,8 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
 
     sample_mean = np.mean(features, 0)
     sample_cov = np.cov(features, rowvar=False)
+    if sample_cov.ndim == 0:
+        sample_cov = np.zeros((features.shape[1], features.shape[1]))
 
     fid = calc_fid(sample_mean, sample_cov, args.real_mean, args.real_cov)
     if writter is not None:
@@ -720,6 +729,25 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class StateModulator(nn.Module):
+    def __init__(self, in_dim: int = 512, out_layers: int = 14, bias_init: float = 2.5):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim + 1, in_dim)
+        self.act = nn.ReLU()
+        self.fc2 = nn.Linear(in_dim, out_layers)
+        self.bias = nn.Parameter(torch.full((out_layers,), bias_init))
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, text_embedding: Tensor, g: Tensor) -> Tensor:
+        # text_embedding: [B, 512], g: [B] -> s: [B, 14, 1]
+        g = g.float().unsqueeze(1)
+        x = torch.cat([text_embedding, g], dim=1)
+        raw = self.fc2(self.act(self.fc1(x)))
+        s = torch.sigmoid(raw + self.bias)
+        return s.unsqueeze(-1)
+
+
 class TransModel(nn.Module):
     def __init__(self, d_model: int = 512, nhead: int = 4, dim_feedforward: int = 2048,
                  activation: str = "relu", dropout: float = 0.2,
@@ -742,22 +770,30 @@ class TransModel(nn.Module):
         decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, activation)
         decoder_norm = LayerNorm(d_model)
         self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm)
+        self.state_modulator = StateModulator(in_dim=d_model, out_layers=14, bias_init=2.5)
+        self.last_s = None
 
-    def forward(self, x, text_inputs):
+    def forward(self, x, text_inputs, g: Optional[Tensor] = None):
         with torch.no_grad():
-            text_embedding = self.clip_model.encode_text(text_inputs).detach()
+            text_embedding = self.clip_model.encode_text(text_inputs).detach()  # [B, 512]
         text_embedding = self.text_map(text_embedding)
         text_embedding = text_embedding + self.text_map(text_embedding)
         text_embedding = self.norm1(text_embedding)
 
-        x = x.unsqueeze(1).repeat(1, 14, 1).transpose(0, 1)
+        x = x.unsqueeze(1).repeat(1, 14, 1).transpose(0, 1)  # [14, B, 512]
         x = self.pos_encoder(x)
         x = self.x_map(x)
         x = x + self.x_map(x)
         x = self.norm2(x)
 
         out = self.decoder(tgt=x, memory=text_embedding.unsqueeze(1).transpose(0, 1))
-        out = out.transpose(0, 1)
+        out = out.transpose(0, 1)  # [B, 14, 512]
+        if g is not None:
+            s = self.state_modulator(text_embedding, g)  # [B, 14, 1]
+            out = out * s
+            self.last_s = s
+        else:
+            self.last_s = None
         return out
 
 
