@@ -5,6 +5,7 @@ import numpy as np
 import random
 import warnings
 import time
+from collections import OrderedDict
 from typing import Optional
 
 import torch
@@ -99,6 +100,8 @@ parser.add_argument('--use_counterfactual', action='store_true',
                     help='enable counterfactual keep-edit training (default: False)')
 parser.add_argument('--w_keep', type=float, default=0.5,
                     help='weight for keep loss in counterfactual training (default: 0.5)')
+parser.add_argument('--keep_text_cache_size', type=int, default=4096,
+                    help='max size for keep_text_cache LRU (0 disables cache)')
 
 
 class CLIPLoss(nn.Module):
@@ -355,7 +358,9 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
     end = time.time()
     g_total = 0
     g_ones = 0
-    keep_text_cache = {}
+    keep_text_cache = OrderedDict()
+    cache_enabled = args.keep_text_cache_size > 0
+    print(f"keep_text_cache enabled: {cache_enabled} / size: {args.keep_text_cache_size}")
 
     for i, (clip_text, sampled_text, labels, exist_mask, length) in enumerate(train_loader):
         data_time.update(time.time() - end)
@@ -385,11 +390,19 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
                 sampled_text_base = [str(sampled_text)]
             keep_tokens = []
             for text in sampled_text_base:
-                cached = keep_text_cache.get(text)
-                if cached is None:
-                    cached = clip.tokenize([f"{text}, keep gender unchanged"], truncate=True)
-                    keep_text_cache[text] = cached
-                keep_tokens.append(cached)
+                if cache_enabled:
+                    cached = keep_text_cache.get(text)
+                    if cached is None:
+                        cached = clip.tokenize([f"{text}, keep gender unchanged"], truncate=True)
+                        keep_text_cache[text] = cached
+                        keep_text_cache.move_to_end(text)
+                        if len(keep_text_cache) > args.keep_text_cache_size:
+                            keep_text_cache.popitem(last=False)
+                    else:
+                        keep_text_cache.move_to_end(text)
+                    keep_tokens.append(cached)
+                else:
+                    keep_tokens.append(clip.tokenize([f"{text}, keep gender unchanged"], truncate=True))
             clip_text_keep = torch.cat(keep_tokens, dim=0)
             if args.gpu is not None:
                 clip_text_keep = clip_text_keep.cuda(args.gpu, non_blocking=True)
