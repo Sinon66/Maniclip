@@ -236,9 +236,14 @@ def main_worker(gpu, args):
 
     # Train loader
     if args.decouple:
-        dataset_train = PartTextDataset(split='train', sample_num=args.part_sample_num)
+        dataset_train = PartTextDataset(
+            split='train',
+            sample_num=args.part_sample_num,
+            train_num=args.train_num,
+            val_num=args.val_num,
+        )
     else:
-        dataset_train = TextDataset(split='train')
+        dataset_train = TextDataset(split='train', train_num=args.train_num, val_num=args.val_num)
 
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
@@ -250,7 +255,7 @@ def main_worker(gpu, args):
     )
 
     # Eval loader: always uses TextDataset in this codebase
-    dataset_eval = TextDataset(split='eval')
+    dataset_eval = TextDataset(split='eval', train_num=args.train_num, val_num=args.val_num)
     eval_loader = torch.utils.data.DataLoader(
         dataset_eval,
         batch_size=args.test_batch,
@@ -746,7 +751,7 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
 
 
 class TextDataset(data.Dataset):
-    def __init__(self, split='train'):
+    def __init__(self, split='train', train_num=None, val_num=None):
         self.text_dir = 'data/celeba-caption/'
         self.text_files = os.listdir(self.text_dir)
         self.text_files.sort(key=int_item)
@@ -758,13 +763,18 @@ class TextDataset(data.Dataset):
         self.attrs = np.array([' '.join(a.split('_')).lower() for a in attrs], dtype=object)
         self.anno = data_lines[2:]
 
-        train_num = 25000
+        if train_num is None:
+            train_num = 25000
         if split == 'train':
             self.text_files = self.text_files[:train_num]
             self.anno = self.anno[:train_num]
         else:
-            self.text_files = self.text_files[train_num:]
-            self.anno = self.anno[train_num:]
+            if val_num is None:
+                self.text_files = self.text_files[train_num:]
+                self.anno = self.anno[train_num:]
+            else:
+                self.text_files = self.text_files[train_num:train_num + val_num]
+                self.anno = self.anno[train_num:train_num + val_num]
             self.test_latents = torch.load('data/test_latents_seed100.pt')
 
         self.split = split
@@ -792,7 +802,7 @@ class TextDataset(data.Dataset):
 
 
 class PartTextDataset(data.Dataset):
-    def __init__(self, split='train', sample_num=3):
+    def __init__(self, split='train', sample_num=3, train_num=None, val_num=None):
         self.test_latents = torch.load('data/test_latents_seed100.pt')
         self.split = split
         self.sample_num = sample_num
@@ -803,7 +813,16 @@ class PartTextDataset(data.Dataset):
         attrs[-1] = attrs[-1][:-1]
         self.attrs = np.array([' '.join(a.split('_')).lower() for a in attrs], dtype=object)
 
-        self.img_attr = self.data[2:25002]
+        if train_num is None:
+            train_num = 25000
+        if split == 'train':
+            self.img_attr = self.data[2:2 + train_num]
+        else:
+            if val_num is None:
+                self.img_attr = self.data[2 + train_num:]
+            else:
+                start = 2 + train_num
+                self.img_attr = self.data[start:start + val_num]
 
         self.hair = ['bald', 'bangs', 'black hair', 'blond hair', 'brown hair', 'gray hair',
                      'receding hairline', 'straight hair', 'wavy hair']
