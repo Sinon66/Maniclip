@@ -191,7 +191,8 @@ def main():
         f"use_state_mod={args.use_state_mod}, "
         f"use_adv={args.use_adv}, "
         f"use_counterfactual={args.use_counterfactual}, "
-        f"adv_apply_to={args.adv_apply_to}"
+        f"adv_apply_to={args.adv_apply_to}",
+        flush=True,
     )
 
     if args.seed is not None:

@@ -15,7 +15,10 @@ class SmokeConfig:
     adv_apply_to: Optional[str]
 
     def flag_line(self) -> str:
-        adv_apply_to = self.adv_apply_to if self.adv_apply_to is not None else "auto"
+        if self.adv_apply_to is None:
+            adv_apply_to = "both" if self.use_counterfactual else "base"
+        else:
+            adv_apply_to = self.adv_apply_to
         return (
             "TRAIN_FLAGS: "
             f"use_state_mod={self.use_state_mod}, "
