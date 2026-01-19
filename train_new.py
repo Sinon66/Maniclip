@@ -102,6 +102,10 @@ parser.add_argument('--w_keep', type=float, default=0.5,
                     help='weight for keep loss in counterfactual training (default: 0.5)')
 parser.add_argument('--keep_text_cache_size', type=int, default=4096,
                     help='max size for keep_text_cache LRU (0 disables cache)')
+parser.add_argument('--train_num', type=int, default=None,
+                    help='(train_min) override train split length when provided')
+parser.add_argument('--val_num', type=int, default=None,
+                    help='(train_min) override val split length when provided')
 
 
 class CLIPLoss(nn.Module):
