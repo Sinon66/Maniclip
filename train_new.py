@@ -83,6 +83,12 @@ parser.add_argument("--protect_attr_idx", default=20, type=int,
                     help="protected attribute index for subgroup statistics")
 parser.add_argument('--use_state_mod', action='store_true',
                     help='enable state modulation gate on offsets (default: False)')
+parser.add_argument('--adv_weight', type=float, default=0.1,
+                    help='weight for adversarial GRL loss (default: 0.1)')
+parser.add_argument('--grl_lambda', type=float, default=1.0,
+                    help='gradient reversal lambda (default: 1.0)')
+parser.add_argument('--adv_warmup_steps', type=int, default=500,
+                    help='warmup steps to linearly ramp adv_weight (default: 500)')
 
 
 class CLIPLoss(nn.Module):
@@ -173,7 +179,13 @@ def main_worker(gpu, args):
     torch.cuda.set_device(args.gpu)
     model = model.cuda(args.gpu)
 
-    optimizer = torch.optim.Adam(model.parameters(), args.lr, betas=(0.5, 0.999))
+    discriminator = SubgroupDiscriminator(input_dim=14 * 512).cuda(args.gpu)
+
+    optimizer = torch.optim.Adam(
+        list(model.parameters()) + list(discriminator.parameters()),
+        args.lr,
+        betas=(0.5, 0.999)
+    )
 
     # optionally resume
     if args.resume:
@@ -186,6 +198,8 @@ def main_worker(gpu, args):
             checkpoint = torch.load(load_path, map_location=loc)
         args.start_epoch = checkpoint['epoch']
         model.load_state_dict(checkpoint['state_dict'], strict=False)
+        if 'discriminator_state_dict' in checkpoint:
+            discriminator.load_state_dict(checkpoint['discriminator_state_dict'], strict=False)
         optimizer.load_state_dict(checkpoint['optimizer'])
         print(f"=> loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']})")
 
@@ -257,7 +271,8 @@ def main_worker(gpu, args):
     for epoch in range(args.start_epoch, args.epochs):
         adjust_learning_rate(optimizer, epoch, args)
 
-        train(train_loader, model, writter, generator, clip_loss, optimizer, epoch, args, iteration_num=iteration_num)
+        train(train_loader, model, discriminator, writter, generator, clip_loss, optimizer, epoch, args,
+              iteration_num=iteration_num)
         iteration_num += len(train_loader)
 
         with torch.no_grad():
@@ -269,12 +284,14 @@ def main_worker(gpu, args):
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
+                'discriminator_state_dict': discriminator.state_dict(),
             }, is_best=True, save_folder=args.save_folder)
         else:
             save_checkpoint({
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
+                'discriminator_state_dict': discriminator.state_dict(),
             }, is_best=False, save_folder=args.save_folder)
 
 
@@ -285,7 +302,7 @@ def save_checkpoint(state, is_best, save_folder, filename='latest.pth.tar'):
         shutil.copyfile(filename, os.path.join(save_folder, 'model_best.pth.tar'))
 
 
-def train(train_loader, model, writter, generator, clip_loss, optimizer, epoch, args, iteration_num=0):
+def train(train_loader, model, discriminator, writter, generator, clip_loss, optimizer, epoch, args, iteration_num=0):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     clip_losses = AverageMeter('clip_loss', ':.4e')
@@ -294,15 +311,18 @@ def train(train_loader, model, writter, generator, clip_loss, optimizer, epoch, 
     id_losses = AverageMeter('id_loss', ':.4e')
     face_norm_losses = AverageMeter('face_norm_loss', ':.4e')
     entropy_losses = AverageMeter('entropy_loss', ':.4e')
+    adv_losses = AverageMeter('adv_loss', ':.4e')
     all_losses = AverageMeter('all_losses', ':.4e')
 
     progress = ProgressMeter(
         len(train_loader),
-        [batch_time, data_time, all_losses, clip_losses, w_norm_losses, id_losses, face_norm_losses, entropy_losses],
+        [batch_time, data_time, all_losses, clip_losses, w_norm_losses, id_losses, face_norm_losses, entropy_losses,
+         adv_losses],
         prefix=f"Epoch: [{epoch}]"
     )
 
     model.train()
+    discriminator.train()
     end = time.time()
     g_total = 0
     g_ones = 0
@@ -326,6 +346,8 @@ def train(train_loader, model, writter, generator, clip_loss, optimizer, epoch, 
             g = in_preds[:, args.protect_attr_idx]  # [B]
 
         offset = model(styles, clip_text, g if args.use_state_mod else None)
+        delta = offset  # offset_after_gating: [B, 14, 512]
+        delta_flat = delta.reshape(delta.size(0), -1)  # [B, 14 * 512]
         if args.use_state_mod:
             s = model.last_s
             if s is not None:
@@ -393,6 +415,21 @@ def train(train_loader, model, writter, generator, clip_loss, optimizer, epoch, 
             loss = loss + loss_clip * args.loss_clip_weight
             clip_losses.update(loss_clip.item(), styles.size(0))
             writter.add_scalar('Train/CLIP loss', clip_losses.avg, iteration_num + i)
+
+        adv_weight = args.adv_weight
+        if args.adv_warmup_steps > 0:
+            warmup_factor = min(1.0, float(iteration_num + i + 1) / args.adv_warmup_steps)
+            adv_weight = adv_weight * warmup_factor
+        writter.add_scalar('Train/adv_weight', adv_weight, iteration_num + i)
+
+        logits_adv = discriminator(grad_reverse(delta_flat, args.grl_lambda))
+        loss_adv = args.ce_criterion(logits_adv, g.long())
+        loss = loss + loss_adv * adv_weight
+        adv_losses.update(loss_adv.item(), styles.size(0))
+        writter.add_scalar('Train/loss_adv', adv_losses.avg, iteration_num + i)
+        with torch.no_grad():
+            d_acc = (logits_adv.argmax(dim=1) == g).float().mean().item()
+        writter.add_scalar('Train/D_acc', d_acc, iteration_num + i)
 
         all_losses.update(loss.item(), styles.size(0))
         writter.add_scalar('Train/all loss', all_losses.avg, iteration_num + i)
@@ -746,6 +783,34 @@ class StateModulator(nn.Module):
         raw = self.fc2(self.act(self.fc1(x)))
         s = torch.sigmoid(raw + self.bias)
         return s.unsqueeze(-1)
+
+
+class GradientReversal(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, lambda_: float) -> Tensor:
+        ctx.lambda_ = lambda_
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        return grad_output.neg().mul(ctx.lambda_), None
+
+
+def grad_reverse(x: Tensor, lambda_: float) -> Tensor:
+    return GradientReversal.apply(x, lambda_)
+
+
+class SubgroupDiscriminator(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int = 512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
 
 
 class TransModel(nn.Module):
