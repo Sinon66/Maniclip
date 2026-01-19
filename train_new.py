@@ -769,13 +769,12 @@ class TextDataset(data.Dataset):
             self.text_files = self.text_files[:train_num]
             self.anno = self.anno[:train_num]
         else:
-            if val_num is None:
-                self.text_files = self.text_files[train_num:]
-                self.anno = self.anno[train_num:]
-            else:
-                self.text_files = self.text_files[train_num:train_num + val_num]
-                self.anno = self.anno[train_num:train_num + val_num]
             self.test_latents = torch.load('data/test_latents_seed100.pt')
+            if val_num is None:
+                val_num = self.test_latents.shape[0] - train_num
+            val_num = min(val_num, self.test_latents.shape[0])
+            self.text_files = self.text_files[train_num:train_num + val_num]
+            self.anno = self.anno[train_num:train_num + val_num]
 
         self.split = split
         self.non_represents = ['no', 'hair', 'wearing', 'eyebrows', 'eyes', 'big', 'nose', 'o']
@@ -819,10 +818,10 @@ class PartTextDataset(data.Dataset):
             self.img_attr = self.data[2:2 + train_num]
         else:
             if val_num is None:
-                self.img_attr = self.data[2 + train_num:]
-            else:
-                start = 2 + train_num
-                self.img_attr = self.data[start:start + val_num]
+                val_num = self.test_latents.shape[0] - train_num
+            val_num = min(val_num, self.test_latents.shape[0])
+            start = 2 + train_num
+            self.img_attr = self.data[start:start + val_num]
 
         self.hair = ['bald', 'bangs', 'black hair', 'blond hair', 'brown hair', 'gray hair',
                      'receding hairline', 'straight hair', 'wavy hair']
