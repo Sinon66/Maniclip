@@ -33,6 +33,26 @@ from utils.data_processing import produce_labels
 from utils.model_irse import IRSE
 
 
+HISTOGRAM_WARNING_TAGS = set()
+
+
+def safe_add_histogram(writer, tag, values, step, fallback_values=None):
+    if writer is None:
+        return
+    try:
+        writer.add_histogram(tag, values, step)
+    except Exception as exc:
+        if fallback_values is not None:
+            try:
+                writer.add_histogram(tag, fallback_values, step)
+                return
+            except Exception as fallback_exc:
+                exc = fallback_exc
+        if tag not in HISTOGRAM_WARNING_TAGS:
+            warnings.warn(f"Skipping histogram {tag} due to error: {exc}")
+            HISTOGRAM_WARNING_TAGS.add(tag)
+
+
 parser = argparse.ArgumentParser(description='ManiCLIP Training')
 parser.add_argument('-j', '--workers', default=16, type=int, metavar='N',
                     help='number of data loading workers (default: 16)')
@@ -379,10 +399,14 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
     cache_enabled = args.keep_text_cache_size > 0
     print(f"keep_text_cache enabled: {cache_enabled} / size: {args.keep_text_cache_size}")
 
+    log_g = args.log_g_only or args.use_state_mod or args.use_adv or args.use_counterfactual
     for i, (clip_text, sampled_text, labels, exist_mask, length) in enumerate(train_loader):
         data_time.update(time.time() - end)
 
         global_step = iteration_num + i
+        writter.add_scalar('Train/flags_use_state_mod', int(args.use_state_mod), global_step)
+        writter.add_scalar('Train/flags_use_adv', int(args.use_adv), global_step)
+        writter.add_scalar('Train/flags_use_counterfactual', int(args.use_counterfactual), global_step)
         cf_enabled_this_step = args.use_counterfactual and (global_step % args.counterfactual_every == 0)
         writter.add_scalar('Train/cf_enabled_this_step', int(cf_enabled_this_step), global_step)
         writter.add_scalar('Train/cf_microbatch', args.cf_microbatch, global_step)
@@ -419,7 +443,7 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
                                         truncation=args.truncation, truncation_latent=args.mean_latent)
 
                 g = None
-                if args.use_state_mod or args.use_adv or args.use_counterfactual or args.log_g_only:
+                if log_g:
                     in_attr = args.face_model(torchvision.transforms.functional.resize(input_im, 256))
                     in_preds = torch.stack(in_attr).transpose(0, 1).argmax(-1)
                     g = in_preds[:, args.protect_attr_idx]
@@ -455,9 +479,13 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
             delta_base_flat = delta_base.reshape(delta_base.size(0), -1)
             if args.use_state_mod:
                 s = model.last_s
-                if s is not None:
+                s_computed = s is not None
+                writter.add_scalar('Train/s_computed_this_step', int(s_computed), global_step)
+                if s_computed:
                     writter.add_scalar('Train/s_mean', s.mean().item(), global_step)
                     writter.add_scalar('Train/s_std', s.std().item(), global_step)
+            else:
+                writter.add_scalar('Train/s_computed_this_step', 0, global_step)
             new_styles = styles.unsqueeze(1).repeat(1, 14, 1) + offset_base
 
             gen_im_base, _ = generator([new_styles], input_is_latent=True, randomize_noise=False,
@@ -479,6 +507,14 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
             if g is not None:
                 g_mean = g.float().mean().item()
                 writter.add_scalar('Train/g_mean', g_mean, global_step)
+                g_hist_values = g.detach().float().cpu().numpy()
+                safe_add_histogram(
+                    writter,
+                    'Train/g_hist',
+                    g_hist_values,
+                    global_step,
+                    fallback_values=g.detach().float().cpu()
+                )
                 g_total += g.numel()
                 g_ones += g.sum().item()
 
@@ -640,6 +676,10 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
     features = []
     end = time.time()
 
+    log_g = args.log_g_only or args.use_state_mod or args.use_adv or args.use_counterfactual
+    g_total = 0
+    g_ones = 0
+    g_values = []
     for i, (clip_text, sampled_text, labels, exist_mask, length, test_latents) in enumerate(eval_loader):
         data_time.update(time.time() - end)
 
@@ -656,10 +696,13 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
 
         g = None
         in_attr = None
-        if args.use_state_mod:
+        if log_g:
             in_attr = args.face_model(torchvision.transforms.functional.resize(input_im, 256))
             in_preds = torch.stack(in_attr).transpose(0, 1).argmax(-1)  # [B, 40]
             g = in_preds[:, args.protect_attr_idx]  # [B]
+            g_total += g.numel()
+            g_ones += g.sum().item()
+            g_values.append(g.detach().to('cpu'))
 
         offset = model(styles, clip_text, g if args.use_state_mod else None)
         new_styles = styles.unsqueeze(1).repeat(1, 14, 1) + offset
@@ -779,6 +822,17 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
         writter.add_scalar('Val/fid', fid, epoch)
         writter.add_scalar('Val/face acc', acc_avg.avg, epoch)
         writter.add_scalar('Val/face id sim', 100 * (1 - id_losses.avg), epoch)
+        if log_g and g_total > 0:
+            writter.add_scalar('Val/g_mean', g_ones / g_total, epoch)
+            if g_values:
+                g_hist_values = torch.cat(g_values, dim=0).float().cpu().numpy()
+                safe_add_histogram(
+                    writter,
+                    'Val/g_hist',
+                    g_hist_values,
+                    epoch,
+                    fallback_values=torch.from_numpy(g_hist_values)
+                )
 
     print()
     print(f'fid: {fid}', flush=True)
