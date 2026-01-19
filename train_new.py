@@ -667,9 +667,10 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
         writter.add_scalar('Val/face acc', acc_avg.avg, epoch)
         writter.add_scalar('Val/face id sim', 100 * (1 - id_losses.avg), epoch)
 
-    print('fid: ', fid)
-    print('face id sim: ', 100 * (1 - id_losses.avg))
-    print('face attribute accuracy: ', acc_avg.avg)
+    print()
+    print(f'fid: {fid}', flush=True)
+    print(f'face id sim: {100 * (1 - id_losses.avg)}', flush=True)
+    print(f'face attribute accuracy: {acc_avg.avg}', flush=True)
 
     return fid
 
