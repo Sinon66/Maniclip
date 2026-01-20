@@ -641,12 +641,12 @@ class PartTextDataset(data.Dataset):
         sampled_class = torch.randint(0, 5, (1,)).item()
         instance_attr = self.groups[sampled_class]
         sampled_cate = torch.randperm(len(instance_attr))[:self.sample_num]
-        attr = np.array(instance_attr)[sampled_cate]
+        attr = np.array(instance_attr)[sampled_cate.tolist()]
         if self.sample_num == 1:
             attr = np.array([attr])
         selected_cate_40 = []
         for x in attr:
-            selected_cate_40.append(np.where(self.attrs==x)[0][0])
+            selected_cate_40.append(int(np.where(self.attrs == x)[0][0]))
 
         gender = torch.randint(0, 3, (1,)).item()
         concat_text = ', '.join(attr)
@@ -659,7 +659,7 @@ class PartTextDataset(data.Dataset):
 
         clip_text = clip.tokenize(sampled_text)
         exist_mask = torch.zeros(40)
-        exist_mask[selected_cate_40] = 1
+        exist_mask[torch.tensor(selected_cate_40, dtype=torch.long)] = 1
         labels = exist_mask.clone()
 
         if gender != 2:
