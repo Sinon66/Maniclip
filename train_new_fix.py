@@ -1045,10 +1045,10 @@ class PartTextDataset(data.Dataset):
     def __getitem__(self, index):
         sampled_class = torch.randint(0, 5, (1,)).item()
         instance_attr = self.groups[sampled_class]
-        sampled_cate = torch.randperm(len(instance_attr))[:self.sample_num]
-        attr = np.array(instance_attr)[sampled_cate]
+        sampled_cate = torch.randperm(len(instance_attr))[:self.sample_num].tolist()
+        attr = [instance_attr[i] for i in sampled_cate]
         if self.sample_num == 1:
-            attr = np.array([attr])
+            attr = [attr[0]]
 
         # FIX: numpy.int64 -> Python int, then index as torch.long
         selected_cate_40 = []
