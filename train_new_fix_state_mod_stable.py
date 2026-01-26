@@ -234,6 +234,7 @@ def main_worker(gpu, args):
 
     if args.gpu is not None:
         print(f"Use GPU: {args.gpu} for training")
+        torch.cuda.set_device(args.gpu)
 
     args.clip_model, _ = clip.load("ViT-B/32", device="cuda")
     clip_loss = CLIPLoss(args.clip_model)
@@ -242,9 +243,12 @@ def main_worker(gpu, args):
     args.id_loss = IDLoss().cuda().eval()
 
     face_model = IRSE()
-    face_model = nn.DataParallel(face_model).cuda()
+    face_model = face_model.cuda(args.gpu)
     checkpoint = torch.load('pretrained/attribute_model.pth.tar')
-    face_model.load_state_dict(checkpoint['state_dict'])
+    face_state = checkpoint.get('state_dict', checkpoint)
+    if any(k.startswith('module.') for k in face_state.keys()):
+        face_state = {k.replace('module.', '', 1): v for k, v in face_state.items()}
+    face_model.load_state_dict(face_state)
     face_model.eval()
     args.face_model = face_model
 
@@ -253,7 +257,6 @@ def main_worker(gpu, args):
     model.clip_model = model.clip_model.float()
     print(model)
 
-    torch.cuda.set_device(args.gpu)
     model = model.cuda(args.gpu)
     # propagate state_mod_floor into module (no effect if use_state_mod is off)
     if hasattr(model, 'state_modulator'):
@@ -698,7 +701,8 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
 
             if args.use_counterfactual and g is not None and cf_enabled_this_step and gen_im_keep is not None and keep_idx is not None:
                 g_keep_lbl = g[keep_idx]
-                keep_attr = args.face_model(torchvision.transforms.functional.resize(gen_im_keep, 256))
+                with torch.no_grad():
+                    keep_attr = args.face_model(torchvision.transforms.functional.resize(gen_im_keep, 256))
                 logits_keep = torch.stack(keep_attr).transpose(0, 1)
                 protected_logits = logits_keep[:, args.protect_attr_idx, :]
                 loss_keep = F.cross_entropy(protected_logits, g_keep_lbl.long(), reduction='mean')
@@ -803,7 +807,8 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
         g = None
         in_attr = None
         if log_g:
-            in_attr = args.face_model(torchvision.transforms.functional.resize(input_im, 256))
+            with torch.no_grad():
+                in_attr = args.face_model(torchvision.transforms.functional.resize(input_im, 256))
             in_preds = torch.stack(in_attr).transpose(0, 1).argmax(-1)  # [B, 40]
             g = in_preds[:, args.protect_attr_idx]  # [B]
             g_total += g.numel()
@@ -820,8 +825,10 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
         gen_im = sanitize_images(gen_im)
 
         if in_attr is None:
-            in_attr = args.face_model(torchvision.transforms.functional.resize(input_im, 256))
-        gen_attr = args.face_model(torchvision.transforms.functional.resize(gen_im, 256))
+            with torch.no_grad():
+                in_attr = args.face_model(torchvision.transforms.functional.resize(input_im, 256))
+        with torch.no_grad():
+            gen_attr = args.face_model(torchvision.transforms.functional.resize(gen_im, 256))
         in_preds = torch.stack(in_attr).transpose(0, 1).argmax(-1)
         gen_preds = torch.stack(gen_attr).transpose(0, 1).argmax(-1)
         out_label = torch.where(exist_mask == 1, labels.long(), in_preds)
