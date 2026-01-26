@@ -517,11 +517,11 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
             offset_base = model(styles, clip_text_base, g_used)
             delta_base = offset_base
             delta_base_flat = delta_base.reshape(delta_base.size(0), -1)
-            state_mod_reg_loss = None
+            loss = 0.0
             if args.use_state_mod:
                 s = model.last_s
                 if s is not None and args.state_mod_reg_weight > 0:
-                    state_mod_reg_loss = args.state_mod_reg_weight * (1.0 - s).mean()
+                    loss = loss + args.state_mod_reg_weight * (1.0 - s).mean()
                 s_computed = s is not None
                 writter.add_scalar('Train/s_computed_this_step', int(s_computed), global_step)
                 if s_computed:
@@ -571,9 +571,6 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
                     img_keep_l1 = (gen_im_keep - input_im[keep_idx]).abs().mean()
                 writter.add_scalar('Train/keep_img_l1', img_keep_l1.item(), global_step)
 
-            loss = 0.0
-            if state_mod_reg_loss is not None:
-                loss = loss + state_mod_reg_loss
             if g is not None:
                 g_mean = g.float().mean().item()
                 writter.add_scalar('Train/g_mean', g_mean, global_step)
