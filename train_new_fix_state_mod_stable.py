@@ -517,6 +517,7 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
             offset_base = model(styles, clip_text_base, g_used)
             delta_base = offset_base
             delta_base_flat = delta_base.reshape(delta_base.size(0), -1)
+            loss = 0.0
             if args.use_state_mod:
                 s = model.last_s
                 if s is not None and args.state_mod_reg_weight > 0:
@@ -570,7 +571,6 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
                     img_keep_l1 = (gen_im_keep - input_im[keep_idx]).abs().mean()
                 writter.add_scalar('Train/keep_img_l1', img_keep_l1.item(), global_step)
 
-            loss = 0.0
             if g is not None:
                 g_mean = g.float().mean().item()
                 writter.add_scalar('Train/g_mean', g_mean, global_step)
@@ -1027,7 +1027,7 @@ class PartTextDataset(data.Dataset):
     def __getitem__(self, index):
         sampled_class = torch.randint(0, 5, (1,)).item()
         instance_attr = self.groups[sampled_class]
-        sampled_cate = torch.randperm(len(instance_attr))[:self.sample_num]
+        sampled_cate = torch.randperm(len(instance_attr))[:self.sample_num].numpy()
         attr = np.array(instance_attr)[sampled_cate]
         if self.sample_num == 1:
             attr = np.array([attr])
