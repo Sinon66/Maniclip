@@ -181,6 +181,17 @@ def safe_write_text_lines(fp, sampled_text, max_lines=9):
         fp.write(f"{k}: {sampled_text[k]}\n")
 
 
+def sanitize_images(images: Tensor, clamp_min: float = -1.0, clamp_max: float = 1.0) -> Tensor:
+    """
+    Ensure images are finite and within expected range to avoid CUDA kernel failures
+    in downstream models (e.g., face attribute / ID networks).
+    """
+    if images is None:
+        return images
+    images = torch.nan_to_num(images, nan=0.0, posinf=clamp_max, neginf=clamp_min)
+    return images.clamp(min=clamp_min, max=clamp_max)
+
+
 def main():
     args = parser.parse_args()
     if args.counterfactual_every < 1:
@@ -555,10 +566,10 @@ def train(train_loader, model, discriminator, writter, generator, clip_loss, opt
                 writter.add_scalar('Train/keep_batch_frac', 0.0, global_step)
 
 
-            input_im = input_im.clamp(min=-1, max=1)
-            gen_im_base = gen_im_base.clamp(min=-1, max=1)
+            input_im = sanitize_images(input_im)
+            gen_im_base = sanitize_images(gen_im_base)
             if gen_im_keep is not None:
-                gen_im_keep = gen_im_keep.clamp(min=-1, max=1)
+                gen_im_keep = sanitize_images(gen_im_keep)
 
             # Debug: monitor collapse to identity mapping (no visible edit)
             with torch.no_grad():
@@ -805,8 +816,8 @@ def validate(eval_loader, model, writter, generator, clip_loss, epoch, args):
         gen_im, _ = generator([new_styles], input_is_latent=True, randomize_noise=False,
                               truncation=args.truncation, truncation_latent=args.mean_latent)
 
-        input_im = input_im.clamp(min=-1, max=1)
-        gen_im = gen_im.clamp(min=-1, max=1)
+        input_im = sanitize_images(input_im)
+        gen_im = sanitize_images(gen_im)
 
         if in_attr is None:
             in_attr = args.face_model(torchvision.transforms.functional.resize(input_im, 256))
