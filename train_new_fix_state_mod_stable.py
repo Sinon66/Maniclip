@@ -234,6 +234,7 @@ def main_worker(gpu, args):
 
     if args.gpu is not None:
         print(f"Use GPU: {args.gpu} for training")
+        torch.cuda.set_device(args.gpu)
 
     args.clip_model, _ = clip.load("ViT-B/32", device="cuda")
     clip_loss = CLIPLoss(args.clip_model)
@@ -242,7 +243,7 @@ def main_worker(gpu, args):
     args.id_loss = IDLoss().cuda().eval()
 
     face_model = IRSE()
-    face_model = nn.DataParallel(face_model).cuda()
+    face_model = face_model.cuda(args.gpu)
     checkpoint = torch.load('pretrained/attribute_model.pth.tar')
     face_model.load_state_dict(checkpoint['state_dict'])
     face_model.eval()
@@ -253,7 +254,6 @@ def main_worker(gpu, args):
     model.clip_model = model.clip_model.float()
     print(model)
 
-    torch.cuda.set_device(args.gpu)
     model = model.cuda(args.gpu)
     # propagate state_mod_floor into module (no effect if use_state_mod is off)
     if hasattr(model, 'state_modulator'):
